@@ -51,7 +51,7 @@ provide spatially varying live blur radius.
 | Purpose | Command | Expected on success |
 |---|---|---|
 | Full JS gate | `bun run check` | exit 0 |
-| Private source scan | `rg -n 'CAFilter|variableBlur|NSClassFromString|NSSelectorFromString|filterWithType|inputMaskImage|base64Decode' modules/progressive-blur` | exit 1, no matches |
+| Private source scan | `rg -n -e 'CAFilter' -e 'variableBlur' -e 'NSClassFromString' -e 'NSSelectorFromString' -e 'filterWithType' -e 'inputMaskImage' -e 'base64Decode' modules/progressive-blur` | exit 1, no matches |
 | Native build | `xcodebuild -workspace ios/amber.xcworkspace -scheme amber -configuration Release -sdk iphonesimulator -derivedDataPath /tmp/amber-private-api-check CODE_SIGNING_ALLOWED=NO build` | exit 0, `** BUILD SUCCEEDED **` |
 
 ## Suggested executor toolkit
@@ -139,8 +139,11 @@ fi
 if rg \
   -e 'CAFilter' \
   -e 'variableBlur' \
-  -e 'filterWithType:' \
+  -e 'NSClassFromString' \
+  -e 'NSSelectorFromString' \
+  -e 'filterWithType' \
   -e 'inputMaskImage' \
+  -e 'base64Decode' \
   "$SCAN_OUTPUT"; then
   rg_status=0
 else
