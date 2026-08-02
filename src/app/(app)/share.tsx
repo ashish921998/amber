@@ -21,7 +21,7 @@ import { useMutation } from 'convex/react';
 import * as Crypto from 'expo-crypto';
 import { useRouter } from 'expo-router';
 import { useIncomingShare } from 'expo-sharing';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -89,6 +89,18 @@ export default function ShareScreen() {
   // Tracks the session id we have already reacted to, so a reconciliation that
   // re-returns the same active session does not re-trigger a save run.
   const reactedSessionId = useRef<string | null>(null);
+
+  /** The injected save operations, built once. Both the initial run and a
+   * "Retry failed" press share this so the deps object is never rebuilt. */
+  const saveDeps = useMemo<ShareSaveDeps>(
+    () => ({
+      saveLink: ({ url, operationId }) => createLinkItem({ url, operationId }),
+      saveNote: ({ text, operationId }) => createNoteItem({ text, operationId }),
+      saveImage: ({ image, operationId }) =>
+        saveImages([{ image, operationId }]).then((results) => results[0]),
+    }),
+    [createLinkItem, createNoteItem, saveImages],
+  );
 
   /** The single idempotent completion path used by all-success, continue, AND
    * cancel. Cancel reuses it deliberately so the same persist-complete → native
@@ -216,23 +228,14 @@ export default function ShareScreen() {
       return;
     }
 
-    const deps: ShareSaveDeps = {
-      saveLink: ({ url, operationId }) => createLinkItem({ url, operationId }),
-      saveNote: ({ text, operationId }) => createNoteItem({ text, operationId }),
-      saveImage: ({ image, operationId }) =>
-        saveImages([{ image, operationId }]).then((results) => results[0]),
-    };
-
     // Fire and forget; runSave guards re-entrancy and sets terminal phase.
-    void runSave(session, toResolved(resolvedSharedPayloads), deps);
+    void runSave(session, toResolved(resolvedSharedPayloads), saveDeps);
   }, [
     sharedPayloads,
     resolvedSharedPayloads,
     isResolving,
     error,
-    createLinkItem,
-    createNoteItem,
-    saveImages,
+    saveDeps,
     runSave,
     completeSession,
   ]);
@@ -346,15 +349,7 @@ export default function ShareScreen() {
               onPress={() => {
                 const live = loadSession(shareStore);
                 if (live === null) return;
-                const deps: ShareSaveDeps = {
-                  saveLink: ({ url, operationId }) =>
-                    createLinkItem({ url, operationId }),
-                  saveNote: ({ text, operationId }) =>
-                    createNoteItem({ text, operationId }),
-                  saveImage: ({ image, operationId }) =>
-                    saveImages([{ image, operationId }]).then((r) => r[0]),
-                };
-                void runSave(live, toResolved(resolvedSharedPayloads), deps);
+                void runSave(live, toResolved(resolvedSharedPayloads), saveDeps);
               }}
             />
           ) : null}

@@ -117,26 +117,37 @@ describe("reconcileSession", () => {
     expect(result.session.entries[0].itemId).toBe("items-1");
   });
 
-  it("clears native payloads for a matching completed session then deletes the record", () => {
+  it("directs a clear for a matching completed session but KEEPS the record until clear succeeds", () => {
+    // The throwing-clear invariant: reconcileSession must NOT delete the
+    // completed session. If it did, a throwing native clear on remount would
+    // leave native payloads with no session, and the next remount would treat
+    // the batch as new and re-save everything (duplicates). The caller owns the
+    // delete, only after a non-throwing clear.
     const store = memoryStore();
     reconcileSession(store, BATCH_A, id);
     updateEntry(store, 0, { status: "saved", itemId: "items-1", kind: "link" });
     markComplete(store);
 
-    // The completed session is reconciled once: it directs a clear and is gone.
     const result = reconcileSession(store, BATCH_A, id);
     expect(result.kind).toBe("clear");
+    // Record is intentionally retained: a failed clear must be retryable.
+    expect(loadSession(store)).not.toBeNull();
+    expect(loadSession(store)?.phase).toBe("complete");
+
+    // The caller deletes only after the native clear succeeds.
+    deleteSession(store);
     expect(loadSession(store)).toBeNull();
   });
 
   it("starts a fresh session when a later re-share matches a stale completed record", () => {
-    // Completed state is single-use: after reconcile cleared it above, an
+    // Completed state is single-use: after the caller cleared and deleted, an
     // identical-content re-share must start a NEW session, not be dropped.
     const store = memoryStore();
     reconcileSession(store, BATCH_A, id);
     updateEntry(store, 0, { status: "saved", itemId: "items-1", kind: "link" });
     markComplete(store);
-    reconcileSession(store, BATCH_A, id); // consumes the completed record
+    reconcileSession(store, BATCH_A, id); // directs a clear (record retained)
+    deleteSession(store); // caller deletes after a successful clear
     expect(loadSession(store)).toBeNull();
 
     // A deliberate later re-share of identical content is a fresh session.
@@ -144,6 +155,33 @@ describe("reconcileSession", () => {
     expect(result.kind).toBe("new");
     if (result.kind !== "new") return;
     expect(result.session.entries[0].status).toBe("pending");
+  });
+
+  it("keeps directing a clear on repeated remounts until the caller deletes (throwing-clear safety)", () => {
+    // The throwing-clear invariant in full: if the native clear keeps failing,
+    // reconcileSession must keep returning 'clear' with the completed record
+    // intact, so every remount retries the clear rather than starting a new
+    // session that would re-save everything (duplicates).
+    const store = memoryStore();
+    reconcileSession(store, BATCH_A, id);
+    updateEntry(store, 0, { status: "saved", itemId: "items-1", kind: "link" });
+    markComplete(store);
+
+    // First remount: clear fails (caller does NOT delete).
+    let result = reconcileSession(store, BATCH_A, id);
+    expect(result.kind).toBe("clear");
+    expect(loadSession(store)?.phase).toBe("complete");
+
+    // Second remount: clear still failing — still 'clear', record still there.
+    result = reconcileSession(store, BATCH_A, id);
+    expect(result.kind).toBe("clear");
+    expect(loadSession(store)?.phase).toBe("complete");
+
+    // Third remount: clear finally succeeds, caller deletes — record is gone.
+    result = reconcileSession(store, BATCH_A, id);
+    expect(result.kind).toBe("clear");
+    deleteSession(store);
+    expect(loadSession(store)).toBeNull();
   });
 
   it("starts a new session when the fingerprint differs", () => {

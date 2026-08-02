@@ -199,11 +199,12 @@ export function reconcileSession(
 
   // Same batch as the persisted session.
   if (existing.phase === 'complete') {
-    // Single-use: clearing the native payloads is the last reconciliation step
-    // for a completed session. Delete the record so a later identical re-share
-    // (a NEW share of the same content) does not match this stale completed
-    // record and get silently dropped. The caller performs the native clear.
-    deleteSession(store);
+    // Direct the caller to clear the native payloads WITHOUT deleting the
+    // record here: the caller's native clear may throw, and if it does the
+    // completed session MUST stay so a remount reconciles and retries the
+    // clear. The caller deletes the record only after a non-throwing clear
+    // (single-use: once cleared, a later identical re-share starts a fresh
+    // session instead of matching this stale completed record).
     return { kind: 'clear', session: existing };
   }
 

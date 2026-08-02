@@ -783,7 +783,7 @@ async function createItemWithOperation(
   ctx: MutationCtx,
   userId: string,
   kind: Extract<OperationKind, "link" | "note">,
-  fields: { url: string } | { note: string },
+  payload: { url: string } | { note: string },
   options: {
     operationId?: string;
     spaceId?: Id<"spaces">;
@@ -794,15 +794,7 @@ async function createItemWithOperation(
   // Validate BEFORE consulting the ledger so a retry with corrected input is
   // never short-circuited by an idempotent read, and an invalid input never
   // creates a half-completed operation.
-  if (kind === "link") {
-    if (("url" in fields && fields.url === "https://") || !("url" in fields)) {
-      throw new Error("Invalid URL");
-    }
-  } else {
-    if (!("note" in fields) || fields.note.trim() === "") {
-      throw new Error("Note text is empty");
-    }
-  }
+  validateLinkOrNotePayload(kind, payload);
 
   // Operation-guarded path (durable share operations). Reads & writes happen in
   // the same mutation transaction, so a retry that races itself resolves to one
@@ -827,18 +819,7 @@ async function createItemWithOperation(
       await ctx.db.patch(op._id, { status: "pending", itemId: undefined });
     }
 
-    const itemId = await ctx.db.insert("items", {
-      userId,
-      type: kind,
-      status: "processing",
-      ...(kind === "link" ? { url: (fields as { url: string }).url } : {}),
-      ...(kind === "note" ? { note: (fields as { note: string }).note } : {}),
-      tags: [],
-      searchText: "",
-    });
-    if (options.spaceId !== undefined) {
-      await saveIntoSpace(ctx, userId, itemId, options.spaceId);
-    }
+    const itemId = await insertLinkOrNote(ctx, userId, kind, payload, options.spaceId);
     if (op === null) {
       await ctx.db.insert("itemOperations", {
         userId,
@@ -860,17 +841,47 @@ async function createItemWithOperation(
   }
 
   // Ordinary (non-idempotent) path: one item per call, no ledger row.
+  return await insertLinkOrNote(ctx, userId, kind, payload, options.spaceId);
+}
+
+/** Throws if a link/note payload is empty/invalid. Validation is shared by the
+ * operation-guarded and ordinary paths so both reject bad input identically. */
+function validateLinkOrNotePayload(
+  kind: Extract<OperationKind, "link" | "note">,
+  payload: { url: string } | { note: string },
+): void {
+  if (kind === "link") {
+    if (!("url" in payload) || payload.url === "https://") {
+      throw new Error("Invalid URL");
+    }
+    return;
+  }
+  if (!("note" in payload) || payload.note.trim() === "") {
+    throw new Error("Note text is empty");
+  }
+}
+
+/** Inserts a link or note item, files it into the optional space, and schedules
+ * AI processing. The kind/payload pairing is discriminated so the compiler
+ * narrows without a cast. Shared by both createItemWithOperation code paths. */
+async function insertLinkOrNote(
+  ctx: MutationCtx,
+  userId: string,
+  kind: Extract<OperationKind, "link" | "note">,
+  payload: { url: string } | { note: string },
+  spaceId?: Id<"spaces">,
+): Promise<Id<"items">> {
   const itemId = await ctx.db.insert("items", {
     userId,
     type: kind,
     status: "processing",
-    ...(kind === "link" ? { url: (fields as { url: string }).url } : {}),
-    ...(kind === "note" ? { note: (fields as { note: string }).note } : {}),
+    ...(kind === "link" && "url" in payload ? { url: payload.url } : {}),
+    ...(kind === "note" && "note" in payload ? { note: payload.note } : {}),
     tags: [],
     searchText: "",
   });
-  if (options.spaceId !== undefined) {
-    await saveIntoSpace(ctx, userId, itemId, options.spaceId);
+  if (spaceId !== undefined) {
+    await saveIntoSpace(ctx, userId, itemId, spaceId);
   }
   await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
   return itemId;
