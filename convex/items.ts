@@ -349,6 +349,22 @@ async function loadImageOperation(
   return op;
 }
 
+/** True iff no items document references `storageId`. attachImageUpload uses
+ * this to make a client-supplied storage id deletable ONLY when it is a fresh,
+ * unreferenced upload (a redundant retry re-upload) — never another user's
+ * completed-image storage object. A malicious caller cannot weaponize attach to
+ * delete storage they don't own, because a referenced blob is never deleted. */
+async function isStorageUnreferenced(
+  ctx: MutationCtx,
+  storageId: Id<"_storage">,
+): Promise<boolean> {
+  const ref = await ctx.db
+    .query("items")
+    .withIndex("by_storage", (q) => q.eq("storageId", storageId))
+    .first();
+  return ref === null;
+}
+
 /** Discriminated return for beginImageImport. A named type (rather than inline
  * object literals) keeps `kind` a literal so the `returns` validator matches. */
 type BeginImageImportResult =
@@ -396,6 +412,12 @@ export const beginImageImport = mutation({
     const now = Date.now();
 
     if (op === null) {
+      // (userId, operationId) uniqueness is enforced by Convex's serializable
+      // transactions: if two begins race on an empty index range, only one
+      // insert commits; the other's transaction is retried and will observe
+      // the row above as a pending op. No application-level unique index exists
+      // because Convex has no unique secondary indexes — this OCC + retry is
+      // the supported idiom.
       await ctx.db.insert("itemOperations", {
         userId,
         operationId: args.operationId,
@@ -415,6 +437,12 @@ export const beginImageImport = mutation({
       if (op.itemId !== undefined) {
         const item = await ctx.db.get(op.itemId);
         if (item === null) {
+          // Release the now-orphaned storage object before resetting the row,
+          // otherwise the blob leaks (the cleanup cron only sweeps pending
+          // rows, and this row is currently complete).
+          if (op.storageId !== undefined) {
+            await ctx.storage.delete(op.storageId);
+          }
           await ctx.db.patch(op._id, {
             status: "pending",
             itemId: undefined,
@@ -460,8 +488,12 @@ export const attachImageUpload = mutation({
     const now = Date.now();
 
     if (op === null) {
-      // No begin happened (or the row was swept). Create a pending row so the
-      // caller's finalize can still proceed, then attach.
+      // No begin happened (or the row was swept). Adopt the caller's storage id
+      // only if it isn't already referenced by a completed item (defense: a
+      // malicious caller could pass another user's storage id here).
+      if (!(await isStorageUnreferenced(ctx, args.storageId))) {
+        throw new Error("Storage object is already in use");
+      }
       await ctx.db.insert("itemOperations", {
         userId,
         operationId: args.operationId,
@@ -474,21 +506,29 @@ export const attachImageUpload = mutation({
     }
 
     if (op.status === "complete") {
-      // Already finalized: keep the canonical id and discard any redundant
-      // upload from a racing retry.
-      if (op.storageId !== undefined && op.storageId !== args.storageId) {
-        await ctx.storage.delete(args.storageId);
-      }
+      // Already finalized: return the canonical id. We never delete on this
+      // path — the incoming id may belong to a different completed item.
       return { storageId: (op.storageId ?? args.storageId) };
     }
 
     // First attachment wins. A racing retry that supplies a different storageId
-    // has re-uploaded redundantly — delete the redundant blob and return the
-    // canonical id rather than replacing it.
+    // has re-uploaded redundantly; delete the REDUNDANT (incoming) blob — but
+    // only if it is unreferenced, so a client can never delete storage it
+    // doesn't own (e.g. another user's completed-image blob).
     if (op.storageId !== undefined && op.storageId !== args.storageId) {
-      await ctx.storage.delete(args.storageId);
+      if (await isStorageUnreferenced(ctx, args.storageId)) {
+        await ctx.storage.delete(args.storageId);
+      }
       await ctx.db.patch(op._id, { updatedAt: now });
       return { storageId: op.storageId };
+    }
+    // No canonical id yet, or the caller re-sent the same id: adopt it, again
+    // only if unreferenced (the same defense applies).
+    if (
+      op.storageId === undefined &&
+      !(await isStorageUnreferenced(ctx, args.storageId))
+    ) {
+      throw new Error("Storage object is already in use");
     }
     await ctx.db.patch(op._id, { storageId: args.storageId, updatedAt: now });
     return { storageId: args.storageId };
@@ -509,18 +549,21 @@ export const finalizeImageImport = mutation({
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
     requireOperationId(args.operationId);
-    // Validate BEFORE touching the ledger: invalid metadata must not mark the
-    // operation complete, so the caller can retry with corrected input.
-    validateImageMetadata(args);
 
     const op = await loadImageOperation(ctx, userId, args.operationId);
 
-    // Already complete — return the original live item id. (A complete row
-    // pointing at a deleted item should have been recycled by begin; if we
-    // reach here, treat it as complete with the recorded id.)
+    // Already complete — return the original live item id WITHOUT validating
+    // the resubmitted metadata. The idempotent read path must not be gated on
+    // the caller resending identical valid fields; a completed import is final.
+    // (A complete row pointing at a deleted item should have been recycled by
+    // begin; if we reach here, treat it as complete with the recorded id.)
     if (op !== null && op.status === "complete" && op.itemId !== undefined) {
       return op.itemId;
     }
+
+    // Validate BEFORE touching the ledger: invalid metadata must not mark the
+    // operation complete, so the caller can retry with corrected input.
+    validateImageMetadata(args);
 
     if (op === null) {
       // The caller skipped begin (or the row was swept). We have no storageId

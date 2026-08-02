@@ -70,6 +70,10 @@ export default defineSchema({
     searchText: v.string(),
   })
     .index("by_user", ["userId"])
+    // Lets attachImageUpload confirm a client-supplied storage id is not
+    // referenced by any completed item before deleting/adopting it, so a
+    // malicious caller can't point attach at another user's storage object.
+    .index("by_storage", ["storageId"])
     .searchIndex("search_text", {
       searchField: "searchText",
       filterFields: ["userId"],

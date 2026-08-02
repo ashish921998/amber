@@ -321,4 +321,56 @@ describe("image import lifecycle", () => {
     );
     expect(freshBlob).not.toBeNull();
   });
+
+  it("refuses to adopt or delete a storage id referenced by a completed item", async () => {
+    // A completed image for user-a with its own storage object.
+    const ta = as("user-a");
+    await ta.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const victimStorageId = await storeBlob(ta);
+    await ta.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: victimStorageId,
+    });
+    await ta.mutation(api.items.finalizeImageImport, { operationId: OP_ID });
+
+    // A malicious/buggy second operation tries to attach victimStorageId (which
+    // is already referenced by user-a's completed item). attach must REJECT it
+    // rather than adopt it — otherwise finalize/deleteItem could delete the
+    // victim's storage. Defense: only unreferenced storage is adoptable.
+    await ta.mutation(api.items.beginImageImport, { operationId: OP_ID_2 });
+    await expect(
+      ta.mutation(api.items.attachImageUpload, {
+        operationId: OP_ID_2,
+        storageId: victimStorageId,
+      }),
+    ).rejects.toThrow(/already in use/i);
+
+    // The victim blob is intact (not deleted by the rejected attach).
+    const victimAlive = await ta.run(async (ctx) =>
+      ctx.db.system.get("_storage", victimStorageId),
+    );
+    expect(victimAlive).not.toBeNull();
+  });
+
+  it("returns the existing item when finalizing an already-complete op even with bad resubmitted metadata", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const storageId = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId,
+    });
+    const firstId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+      aspectRatio: 1.5,
+    });
+
+    // A retry that resends an impossible aspectRatio must still return the
+    // existing item — the idempotent read path is not gated on re-validation.
+    const retriedId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+      aspectRatio: -1,
+    });
+    expect(retriedId).toBe(firstId);
+  });
 });
