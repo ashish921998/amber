@@ -1,12 +1,12 @@
 import { parseExifDate } from '@/lib/date';
 import { parseExifLocation } from '@/lib/exif';
-import { useSaveImages } from '@/lib/use-save-image';
+import { type ImageSaveRequest, useSaveImages } from '@/lib/use-save-image';
 import type { Id } from '@convex/_generated/dataModel';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, Text, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -45,6 +45,9 @@ export default function CameraScreen() {
   const saveImages = useSaveImages();
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<CaptureMode>('photo');
+  // Holds the last failed single capture/sticker request so an in-screen retry
+  // reuses its operation id instead of minting a fresh one.
+  const failedRequestRef = useRef<ImageSaveRequest | null>(null);
 
   // Slides the active-label highlight between Photo (0) and Sticker (1).
   const progress = useSharedValue(0);
@@ -83,6 +86,44 @@ export default function CameraScreen() {
     color: interpolateColor(progress.value, [0, 1], [INACTIVE, AMBER]),
   }));
 
+  // Runs a batch, closing on success or reporting a partial outcome. Failed
+  // requests keep their operation ids so a retry resubmits only them.
+  const runImageRequests = async (requests: ImageSaveRequest[]) => {
+    if (requests.length === 0) {
+      router.back();
+      return;
+    }
+    setBusy(true);
+    try {
+      const results = await saveImages(requests, pinnedSpace);
+      const failed = results.filter((r) => r.status === 'failed');
+      if (failed.length === 0) {
+        router.back();
+        return;
+      }
+      const savedCount = results.length - failed.length;
+      Alert.alert(
+        'Could not save all images',
+        `${savedCount} of ${results.length} saved. Retry the failed images?`,
+        [
+          {
+            text: 'Retry failed',
+            onPress: () => {
+              void runImageRequests(
+                failed.map((r) => ({ image: r.image, operationId: r.operationId })),
+              );
+            },
+          },
+          { text: 'Done', onPress: () => router.back() },
+        ],
+      );
+      setBusy(false);
+    } catch {
+      Alert.alert('Could not save', 'Uploading failed. Try again.');
+      setBusy(false);
+    }
+  };
+
   const pickFromLibrary = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
@@ -92,24 +133,18 @@ export default function CameraScreen() {
       exif: true,
     });
     if (result.canceled || result.assets.length === 0) return;
-    setBusy(true);
-    try {
-      await saveImages(
-        result.assets.map((asset) => ({
+    await runImageRequests(
+      result.assets.map((asset) => ({
+        image: {
           uri: asset.uri,
           width: asset.width,
           height: asset.height,
           mimeType: asset.mimeType,
           capturedAt: parseExifDate(asset.exif),
           ...parseExifLocation(asset.exif),
-        })),
-        pinnedSpace,
-      );
-      router.back();
-    } catch {
-      Alert.alert('Could not save', 'Uploading failed. Try again.');
-      setBusy(false);
-    }
+        },
+      })),
+    );
   };
 
   const capture = async () => {
@@ -122,6 +157,7 @@ export default function CameraScreen() {
       const photoFile = await photoOutput.capturePhotoToFile({}, {});
       const uri = `file://${photoFile.filePath}`;
 
+      let request: ImageSaveRequest;
       if (mode === 'sticker') {
         const sticker = await liftSubject(uri);
         if (!sticker.hasSubject) {
@@ -132,22 +168,44 @@ export default function CameraScreen() {
           setBusy(false);
           return;
         }
-        await saveImages(
-          [
-            {
-              uri: sticker.uri,
-              width: sticker.width,
-              height: sticker.height,
-              mimeType: 'image/png',
-              isSticker: true,
-            },
-          ],
-          pinnedSpace,
-        );
+        request = {
+          image: {
+            uri: sticker.uri,
+            width: sticker.width,
+            height: sticker.height,
+            mimeType: 'image/png',
+            isSticker: true,
+          },
+        };
       } else {
-        await saveImages([{ uri }], pinnedSpace);
+        request = { image: { uri } };
       }
-      router.back();
+
+      const [result] = await saveImages([request], pinnedSpace);
+      if (result.status === 'saved') {
+        router.back();
+        return;
+      }
+      // Preserve the failed request (with its operation id) so a retry from the
+      // same screen reuses it instead of generating a new one.
+      failedRequestRef.current = { image: result.image, operationId: result.operationId };
+      Alert.alert(
+        'Capture failed',
+        'Could not save that photo. Try again.',
+        [
+          {
+            text: 'Retry',
+            onPress: () => {
+              const failed = failedRequestRef.current;
+              if (!failed) return;
+              failedRequestRef.current = null;
+              void capture();
+            },
+          },
+          { text: 'Cancel', onPress: () => setBusy(false) },
+        ],
+      );
+      setBusy(false);
     } catch {
       Alert.alert('Capture failed', 'Could not take that photo. Try again.');
       setBusy(false);

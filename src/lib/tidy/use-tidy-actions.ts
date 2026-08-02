@@ -64,18 +64,24 @@ export function useTidyActions({ batch, noteDeleted }: Params) {
         // Best-effort: Android needs ACCESS_MEDIA_LOCATION, and not every
         // photo has a GPS fix — a save must never fail over its location.
         const location = await asset.getLocation().catch(() => null);
-        const [itemId] = await saveImages([
+        const [result] = await saveImages([
           {
-            uri,
-            width: photo.width ?? undefined,
-            height: photo.height ?? undefined,
-            mimeType: mimeFromUri(uri),
-            capturedAt: photo.creationTime ?? undefined,
-            latitude: location?.latitude,
-            longitude: location?.longitude,
+            image: {
+              uri,
+              width: photo.width ?? undefined,
+              height: photo.height ?? undefined,
+              mimeType: mimeFromUri(uri),
+              capturedAt: photo.creationTime ?? undefined,
+              latitude: location?.latitude,
+              longitude: location?.longitude,
+            },
           },
         ]);
-        return itemId;
+        // Plan 005 owns durable Tidy save state. Here we preserve the current
+        // contract: a save resolves to the created itemId, or null on failure
+        // so undo can no-op. The result carries the stable operation id for
+        // that future durability work.
+        return result.status === 'saved' ? result.itemId : null;
       })().catch((error) => {
         console.warn('Tidy save failed', error);
         unmarkReviewed(photo.id);
