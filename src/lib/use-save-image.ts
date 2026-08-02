@@ -86,10 +86,12 @@ function generateOperationId(): string {
  * upload URLs, storage ids, or backend stack traces to the UI. */
 function sanitizeMessage(error: unknown, stage: ImageSaveStage): string {
   if (error instanceof Error && error.message) {
-    // Strip anything that looks like a URL or id leaked through a thrown error.
+    // Strip anything that looks like a URL or id leaked through a thrown
+    // error. Real Convex ids are long unbroken lowercase-alphanumeric tokens
+    // (~32 chars, no separators), which no natural-language word reaches.
     const cleaned = error.message
       .replace(/https?:\/\/\S+/gi, '<url>')
-      .replace(/(ks|kg)_[A-Za-z0-9]+/g, '<id>')
+      .replace(/\b[a-z0-9]{25,}\b/g, '<id>')
       .slice(0, 200);
     return cleaned || `Could not complete (${stage})`;
   }
@@ -110,10 +112,16 @@ export async function saveImageOperations(
 ): Promise<ImageSaveResult[]> {
   return await Promise.all(
     requests.map(async (request): Promise<ImageSaveResult> => {
-      const operationId = request.operationId ?? generateOperationId();
       const image = request.image;
       let stage: ImageSaveStage = 'begin';
+      // Minted inside the try: if id generation itself throws, that image must
+      // settle as a failed result like any other error — a rejection here would
+      // reject the whole Promise.all and erase sibling successes.
+      let operationId = request.operationId;
       try {
+        // `||` (not `??`): the empty-string placeholder from a mint failure
+        // must also get a fresh id on retry.
+        operationId = operationId || generateOperationId();
         const began = await deps.begin(operationId);
         if (began.kind === 'complete') {
           // Already finalized server-side (a previous attempt landed); skip the
@@ -147,7 +155,9 @@ export async function saveImageOperations(
       } catch (error) {
         return {
           status: 'failed',
-          operationId,
+          // Only undefined if minting itself threw; the placeholder keeps the
+          // result shape intact and a retry of it simply mints a fresh id.
+          operationId: operationId ?? '',
           image,
           stage,
           message: sanitizeMessage(error, stage),

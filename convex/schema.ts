@@ -158,6 +158,13 @@ export default defineSchema({
     // same durable operationId can be re-performed. Pending rows have no
     // itemId and so are never returned by this index lookup.
     .index("by_item", ["itemId"])
-    // Stale-pending cleanup cron, bounded per run.
-    .index("by_status_updated", ["status", "updatedAt"]),
+    // Lets isStorageUnreferenced see storage held by pending operations (an
+    // uploaded-but-unfinalized blob), not just storage referenced by items —
+    // otherwise the same blob could be adopted into two operations and later
+    // deleted out from under a live item.
+    .index("by_storage", ["storageId"])
+    // Stale-pending cleanup cron, bounded per run. kind leads so the sweep
+    // pages through image rows only and can't be starved by stale link/note
+    // rows once plans 004/005 create them.
+    .index("by_kind_status_updated", ["kind", "status", "updatedAt"]),
 });

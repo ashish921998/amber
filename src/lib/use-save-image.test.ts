@@ -16,7 +16,13 @@ import { describe, expect, it, vi } from "vitest";
 // exercised.
 vi.mock("expo-file-system", () => ({ File: class {} }));
 vi.mock("expo/fetch", () => ({ fetch: vi.fn() }));
-vi.mock("expo-crypto", () => ({ randomUUID: () => "stub-uuid" }));
+vi.mock("expo-crypto", () => {
+  // A counter (not a constant) so tests can assert each image in a batch mints
+  // a DISTINCT operation id — a constant stub would hide an id-reuse bug that
+  // collapses a whole batch into one backend operation.
+  let n = 0;
+  return { randomUUID: () => `stub-uuid-${++n}` };
+});
 vi.mock("@convex/_generated/api", () => ({ api: {} }));
 vi.mock("@convex/_generated/dataModel", () => ({}));
 vi.mock("convex/react", () => ({ useMutation: () => vi.fn() }));
@@ -49,10 +55,12 @@ describe("saveImageOperations", () => {
     // Results follow input order even though tasks run concurrently.
     expect((results[0] as Extract<ImageSaveResult, { status: "saved" }>).image.uri).toBe("a");
     expect((results[2] as Extract<ImageSaveResult, { status: "saved" }>).image.uri).toBe("c");
-    // Each result carries the operation id it minted.
+    // Each result carries the operation id it minted — and every image in the
+    // batch gets its own distinct id.
     for (const r of results) {
-      expect(r.operationId).toMatch(/^image:stub-uuid$/);
+      expect(r.operationId).toMatch(/^image:stub-uuid-\d+$/);
     }
+    expect(new Set(results.map((r) => r.operationId)).size).toBe(3);
   });
 
   it("reports a failed image without hiding its siblings' successes", async () => {
@@ -75,11 +83,10 @@ describe("saveImageOperations", () => {
   });
 
   it("lets a retry submit only the failed operation id, reusing it verbatim", async () => {
-    // First pass: finalize fails for "b".
-    let finalized = new Set<string>();
+    // First pass: finalize is down, so every request fails at that stage.
+    const finalized = new Set<string>();
     const deps = makeDeps({
-      finalize: async (input) => {
-        // Use the operationId embedded by the request to differentiate.
+      finalize: async () => {
         throw new Error("finalize down");
       },
     });
@@ -175,10 +182,14 @@ describe("saveImageOperations", () => {
   });
 
   it("sanitizes URLs and ids out of the failure message", async () => {
+    // Realistic Convex ids: long unbroken lowercase-alphanumeric tokens, no
+    // underscore prefix (the earlier ks_/kg_ fixtures matched nothing real).
+    const storageId = "kg2e5gqf40sy8kdqxcm3vp7hn96wtxyz";
+    const itemId = "jd7bw2mkq4vc9ntxhe6grf8ysm5apqrs";
     const deps = makeDeps({
       upload: async () => {
         throw new Error(
-          "POST https://upload.convex.cloud/abc failed for ks_storage_xyz and ks_items_123",
+          `POST https://upload.convex.cloud/abc failed for ${storageId} and ${itemId}`,
         );
       },
     });
@@ -188,7 +199,21 @@ describe("saveImageOperations", () => {
     );
     const failed = results[0] as Extract<ImageSaveResult, { status: "failed" }>;
     expect(failed.message).not.toContain("https://");
-    expect(failed.message).not.toContain("ks_storage_xyz");
-    expect(failed.message).not.toContain("ks_items_123");
+    expect(failed.message).not.toContain(storageId);
+    expect(failed.message).not.toContain(itemId);
+  });
+
+  it("falls back to a generic message when the thrown value is not an Error", async () => {
+    const deps = makeDeps({
+      upload: async () => {
+        throw "raw string failure";
+      },
+    });
+    const results = await saveImageOperations(
+      [{ image: img("a"), operationId: "image:op-a" }],
+      deps,
+    );
+    const failed = results[0] as Extract<ImageSaveResult, { status: "failed" }>;
+    expect(failed.message).toBe("Could not complete (upload)");
   });
 });
