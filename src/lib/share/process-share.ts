@@ -205,8 +205,6 @@ async function processOne(
   // Re-derive kind + malformed-ness from the resolved payload. If the payload
   // is absent (raw/resolved divergence not caught earlier) or malformed, fail
   // WITHOUT a backend call — no empty link/note item, no wasted round-trip.
-  // The re-derived kind is still returned so the caller can correct a stale
-  // placeholder kind persisted before a crash.
   if (payload === undefined) {
     return { kind: entry.kind, status: 'failed', message: 'No resolved payload for this entry' };
   }
