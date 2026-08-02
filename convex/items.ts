@@ -359,7 +359,16 @@ const STORAGE_IN_USE = "Storage object is already in use";
  * an item or another in-flight operation depends on. Checking `itemOperations`
  * too closes the double-adopt hole: without it the same blob could be adopted
  * into two operations, finalize into two items sharing one blob, and then be
- * destroyed for the survivor when either item is deleted. */
+ * destroyed for the survivor when either item is deleted.
+ *
+ * KNOWN RESIDUAL (plan 003 STOP condition): this does NOT bind a storage id to
+ * (userId, operationId). A blob that a client has POSTed but not yet attached
+ * is referenced by nothing, so it passes here — meaning an authenticated
+ * caller who somehow learns another user's still-un-attached storage id could
+ * adopt or delete it within the brief upload→attach window. The direct-upload
+ * API gives no server-verifiable binding to close this; exposure is limited by
+ * Convex storage ids being unguessable and never surfaced to other users. A
+ * true fix requires server-mediated upload completion — tracked, not done. */
 async function isStorageUnreferenced(
   ctx: MutationCtx,
   storageId: Id<"_storage">,
@@ -538,8 +547,9 @@ export const attachImageUpload = mutation({
       // No begin happened (or the row was swept). Adopt the caller's storage id
       // only if the blob actually exists (a swept id must not become an item
       // with a permanently dead image) and isn't referenced by an item or
-      // another operation (defense: a malicious caller could pass another
-      // user's storage id here).
+      // another operation. NOTE: existence + unreferenced is NOT proof the
+      // caller owns this blob during the un-attached window — see the residual
+      // documented on isStorageUnreferenced.
       if ((await ctx.db.system.get("_storage", args.storageId)) === null) {
         throw new Error("Storage object not found");
       }
@@ -712,17 +722,21 @@ export const STALE_IMPORT_CUTOFF_MS = 24 * 60 * 60 * 1000;
  * finalized), then the ledger row. Complete rows stay as the permanent
  * idempotency record. The index leads with kind so stale link/note rows
  * (plans 004/005) can never fill the page and starve image cleanup. */
+/** Rows swept per transaction. A full page chains a follow-up run, so backlog
+ * drains at scheduler speed instead of one page per cron interval. */
+const CLEANUP_PAGE_SIZE = 100;
+
 export const cleanupStaleImageImports = internalMutation({
   args: {},
   returns: v.null(),
-  handler: async (ctx) => {
+  handler: async (ctx): Promise<null> => {
     const cutoff = Date.now() - STALE_IMPORT_CUTOFF_MS;
     const stale = await ctx.db
       .query("itemOperations")
       .withIndex("by_kind_status_updated", (q) =>
         q.eq("kind", "image").eq("status", "pending").lt("updatedAt", cutoff),
       )
-      .take(100);
+      .take(CLEANUP_PAGE_SIZE);
     for (const op of stale) {
       // Guarded delete: a pending row's blob is normally referenced by nothing
       // else, but if it ever is (item or sibling operation), deleting it would
@@ -736,6 +750,15 @@ export const cleanupStaleImageImports = internalMutation({
         await safeDeleteStorage(ctx, op.storageId);
       }
       await ctx.db.delete(op._id);
+    }
+    // A full page means more stale rows likely remain; sweep again immediately
+    // rather than waiting for the next cron tick.
+    if (stale.length === CLEANUP_PAGE_SIZE) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.items.cleanupStaleImageImports,
+        {},
+      );
     }
     return null;
   },
