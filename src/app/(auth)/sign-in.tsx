@@ -12,17 +12,16 @@ export default function Page() {
 
   const handleDevLogin = async () => {
     if (!signIn) return;
-    const password = process.env.EXPO_PUBLIC_DEV_PASSWORD;
-    if (!password) {
-      console.warn('Dev login: set EXPO_PUBLIC_DEV_PASSWORD in .env.local');
+    const ticket = process.env.EXPO_PUBLIC_DEV_TICKET;
+    if (!ticket) {
+      console.warn('Dev login: set EXPO_PUBLIC_DEV_TICKET in .env.local');
       return;
     }
     setPending(true);
     try {
-      const { error } = await signIn.password({
-        identifier: 'dev+clerk_test@example.com',
-        password,
-      });
+      // Clerk v3: factor-specific methods return { error }, not a session.
+      // The created session lives on `signIn` itself; finalize() activates it.
+      const { error } = await signIn.ticket({ ticket });
       if (error) {
         console.error('Dev login failed:', error);
       } else if (signIn.status === 'complete') {
