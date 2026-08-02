@@ -144,38 +144,49 @@ export default function ShareScreen() {
       if (runningRef.current) return;
       runningRef.current = true;
 
-      // Classify entries (no side effects) if none have been processed yet,
-      // persisting terminal statuses so a crash before any save still records
-      // failed/unsupported entries on remount.
-      const fresh = session.entries.every((e) => e.status === 'pending');
-      let working = session;
-      if (fresh) {
-        const classified = classifyEntries(session, resolved);
-        working = { ...session, entries: classified };
-        for (const entry of classified) {
-          if (entry.status !== 'pending') {
-            persistEntry(entry);
+      try {
+        // Classify entries (no side effects) if none have been processed yet,
+        // persisting terminal statuses so a crash before any save still records
+        // failed/unsupported entries on remount.
+        const fresh = session.entries.every((e) => e.status === 'pending');
+        let working = session;
+        if (fresh) {
+          const classified = classifyEntries(session, resolved);
+          working = { ...session, entries: classified };
+          for (const entry of classified) {
+            if (entry.status !== 'pending') {
+              persistEntry(entry);
+            }
           }
         }
-      }
 
-      setPhase({ kind: 'saving', session: working });
+        setPhase({ kind: 'saving', session: working });
 
-      const result = await processSession(
-        working,
-        resolved,
-        deps,
-        persistEntry, // persist each settled entry so a crash/restart loses nothing
-      );
+        const result = await processSession(
+          working,
+          resolved,
+          deps,
+          persistEntry, // persist each settled entry so a crash/restart loses nothing
+        );
 
-      runningRef.current = false;
-
-      const allSaved = result.entries.every((e) => e.status === 'saved');
-      if (allSaved) {
-        completeSession(result);
-      } else {
-        // Some entries failed or were unsupported: stay and offer retry/continue.
-        setPhase({ kind: 'partial', session: result });
+        const allSaved = result.entries.every((e) => e.status === 'saved');
+        if (allSaved) {
+          completeSession(result);
+        } else {
+          // Some entries failed or were unsupported: stay and offer retry/continue.
+          setPhase({ kind: 'partial', session: result });
+        }
+      } catch (err) {
+        // processSession catches per-entry save failures as data, so an
+        // unexpected throw here is from persistence/classification, not a save.
+        // Reload whatever survived from the store and route to the partial phase
+        // so the user gets retry/continue/cancel — never an eternal "Saving…"
+        // spinner (the plan's "never spin forever" done criterion).
+        console.error('Share save orchestration failed', err);
+        const live = loadSession(shareStore);
+        setPhase({ kind: 'partial', session: live ?? session });
+      } finally {
+        runningRef.current = false;
       }
     },
     [completeSession],
@@ -229,7 +240,11 @@ export default function ShareScreen() {
     }
 
     // Fire and forget; runSave guards re-entrancy and sets terminal phase.
-    void runSave(session, toResolved(resolvedSharedPayloads), saveDeps);
+    // Deferred out of the synchronous effect body so runSave's synchronous
+    // setPhase('saving') does not trigger a cascading render.
+    void Promise.resolve().then(() =>
+      runSave(session, toResolved(resolvedSharedPayloads), saveDeps),
+    );
   }, [
     sharedPayloads,
     resolvedSharedPayloads,
