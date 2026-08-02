@@ -25,14 +25,12 @@ export default function NewSpaceScreen() {
   const { id } = useLocalSearchParams<{ id?: string }>();
   const editing = id !== undefined;
 
-  const { data: space, isLoading } = useQuery({
+  const { data: space, isLoading, isError } = useQuery({
     ...convexQuery(api.spaces.getSpace, { id: (id ?? '') as Id<'spaces'> }),
     enabled: editing,
   });
 
-  // Wait for the space before mounting the edit form so its initial state is
-  // seeded from the server instead of being prefilled by an effect. Creating a
-  // new space needs no load.
+  // Edit mode waits for the space to arrive; create mode renders immediately.
   if (editing && isLoading) {
     return (
       <View style={styles.loading}>
@@ -41,10 +39,11 @@ export default function NewSpaceScreen() {
     );
   }
 
-  // A null result means the space was deleted, isn't ours, or the link is stale.
-  // Bail to a not-found state instead of rendering the create form and silently
-  // making a new space when the user hits save.
-  if (editing && space === null) {
+  // The space is gone, inaccessible, or the link is stale. This guard is the
+  // invariant the form below relies on: `mode: 'edit'` may only mount with a
+  // real space, so it can never fall through to `createSpace`. Without it, a
+  // settled null/error query would render the create form on the edit route.
+  if (editing && (isError || space === null)) {
     return (
       <View style={styles.loading}>
         <Text>This space is no longer available.</Text>
@@ -52,22 +51,23 @@ export default function NewSpaceScreen() {
     );
   }
 
-  return (
-    <SpaceForm
-      key={editing ? (space?._id ?? id) : 'new'}
-      editing={editing}
-      space={space ?? undefined}
-    />
-  );
+  if (editing && space) {
+    return <SpaceForm key={space._id} mode="edit" space={space} />;
+  }
+  return <SpaceForm key="new" mode="create" />;
 }
 
-function SpaceForm({
-  editing,
-  space,
-}: {
-  editing: boolean;
-  space?: Pick<Doc<'spaces'>, '_id' | 'name' | 'dynamic'>;
-}) {
+type Space = Pick<Doc<'spaces'>, '_id' | 'name' | 'dynamic'>;
+
+// A discriminated union makes the two modes impossible to confuse: in edit
+// mode `space` is guaranteed present, so `save` switches on `mode` and the
+// create branch is structurally unreachable from edit mode.
+type SpaceFormProps =
+  | { mode: 'create' }
+  | { mode: 'edit'; space: Space };
+
+function SpaceForm(props: SpaceFormProps) {
+  const editing = props.mode === 'edit';
   const router = useRouter();
   const { theme } = useUnistyles();
   const createSpace = useMutation(api.spaces.createSpace);
@@ -76,10 +76,12 @@ function SpaceForm({
   // Seeded once per (keyed) mount: a fresh create starts dynamic on; an edit
   // starts from the loaded space. A query refresh remounts via key only if the
   // id changes, so user typing is never overwritten.
-  const [name, setName] = useState(space?.name ?? '');
+  const [name, setName] = useState(props.mode === 'edit' ? props.space.name : '');
   // Dynamic is the marquee behavior — on by default for a new space; an edit
   // mirrors the server, treating a legacy status-less space as off.
-  const [dynamic, setDynamic] = useState(editing ? space?.dynamic ?? false : true);
+  const [dynamic, setDynamic] = useState(
+    props.mode === 'edit' ? props.space.dynamic ?? false : true,
+  );
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
@@ -87,8 +89,8 @@ function SpaceForm({
     if (!trimmed || saving) return;
     setSaving(true);
     try {
-      if (editing && space) {
-        await updateSpace({ id: space._id, name: trimmed, dynamic });
+      if (props.mode === 'edit') {
+        await updateSpace({ id: props.space._id, name: trimmed, dynamic });
       } else {
         await createSpace({ name: trimmed, dynamic });
       }

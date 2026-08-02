@@ -1,4 +1,5 @@
 import { AnimatedSwitch } from '@/components/ui/animated-switch';
+import { EmptyState } from '@/components/empty-state';
 import { api } from '@convex/_generated/api';
 import type { Id } from '@convex/_generated/dataModel';
 import { convexQuery } from '@convex-dev/react-query';
@@ -51,6 +52,9 @@ export default function ManageSpacesScreen() {
     else removeItemFromSpace({ itemId: id, spaceId });
   };
 
+  // The item may be `null` (deleted, or not ours) — distinct from `undefined`
+  // (still loading). A null item renders a non-interactive state instead of an
+  // all-off switch list, since every toggle would fire a failing mutation.
   const loading = spaces === undefined || item === undefined;
 
   return (
@@ -60,6 +64,8 @@ export default function ManageSpacesScreen() {
 
       {loading ? (
         <ActivityIndicator style={styles.spinner} />
+      ) : item === null ? (
+        <EmptyState title="Gone" message="This save no longer exists." />
       ) : spaces.length === 0 ? (
         <Text style={styles.empty}>
           No spaces yet — create one from the Spaces tab.
