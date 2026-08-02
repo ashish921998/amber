@@ -326,15 +326,20 @@ function requireOperationId(operationId: string): void {
   }
 }
 
-/** Loads the caller's image operation for `operationId`, or null. The (userId,
+/** The operation kinds the import ledger supports. Kept in one place so the
+ * createLinkItem/createNoteItem operation paths stay in lockstep with the
+ * schema union and the kind-checking read in loadItemOperation. */
+type OperationKind = "image" | "link" | "note";
+
+/** Loads the caller's item operation for `operationId`, or null. The (userId,
  * operationId) pair is the logical unique key — never look one up without both.
  * Callers that expect a specific `kind` must pass it so a reused operation ID
  * can't silently switch from image to link/note. */
-async function loadImageOperation(
+async function loadItemOperation(
   ctx: QueryCtx | MutationCtx,
   userId: string,
   operationId: string,
-  kind: "image" | "link" | "note" = "image",
+  kind: OperationKind = "image",
 ): Promise<Doc<"itemOperations"> | null> {
   const op = await ctx.db
     .query("itemOperations")
@@ -446,7 +451,7 @@ export const beginImageImport = mutation({
   handler: async (ctx, args): Promise<BeginImageImportResult> => {
     const userId = await requireUserId(ctx);
     requireOperationId(args.operationId);
-    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const op = await loadItemOperation(ctx, userId, args.operationId);
     const now = Date.now();
 
     if (op === null) {
@@ -540,7 +545,7 @@ export const attachImageUpload = mutation({
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
     requireOperationId(args.operationId);
-    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const op = await loadItemOperation(ctx, userId, args.operationId);
     const now = Date.now();
 
     if (op === null) {
@@ -624,7 +629,7 @@ export const finalizeImageImport = mutation({
     const userId = await requireUserId(ctx);
     requireOperationId(args.operationId);
 
-    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const op = await loadItemOperation(ctx, userId, args.operationId);
 
     // Already complete — return the original live item id WITHOUT validating
     // the resubmitted metadata. The idempotent read path must not be gated on
@@ -764,52 +769,149 @@ export const cleanupStaleImageImports = internalMutation({
   },
 });
 
+/**
+ * Idempotent completion for a link/note operation. When a durable `operationId`
+ * is supplied, (userId, operationId) is the unique key: a repeat with the same
+ * id returns the previously created item; a kind mismatch rejects; otherwise the
+ * item insert, optional space membership, operation completion, and scheduler
+ * job all land in this one transaction so a crash mid-mutation never leaves a
+ * completed item without its ledger row (or vice versa). Calls without an
+ * operationId skip the ledger entirely and always create a fresh item — the
+ * ordinary Add UI path.
+ */
+async function createItemWithOperation(
+  ctx: MutationCtx,
+  userId: string,
+  kind: Extract<OperationKind, "link" | "note">,
+  fields: { url: string } | { note: string },
+  options: {
+    operationId?: string;
+    spaceId?: Id<"spaces">;
+  },
+): Promise<Id<"items">> {
+  const now = Date.now();
+
+  // Validate BEFORE consulting the ledger so a retry with corrected input is
+  // never short-circuited by an idempotent read, and an invalid input never
+  // creates a half-completed operation.
+  if (kind === "link") {
+    if (("url" in fields && fields.url === "https://") || !("url" in fields)) {
+      throw new Error("Invalid URL");
+    }
+  } else {
+    if (!("note" in fields) || fields.note.trim() === "") {
+      throw new Error("Note text is empty");
+    }
+  }
+
+  // Operation-guarded path (durable share operations). Reads & writes happen in
+  // the same mutation transaction, so a retry that races itself resolves to one
+  // item via Convex's serializable OCC — no application-level unique index.
+  if (options.operationId !== undefined) {
+    requireOperationId(options.operationId);
+    const op = await loadItemOperation(ctx, userId, options.operationId, kind);
+    if (op !== null) {
+      // A recycled operation whose item was deleted (by deleteItem, which
+      // releases the row) shows up as null above. A complete row pointing at a
+      // live item is the idempotent hit; a complete row with no item, or a
+      // pending row, is inconsistent for the single-shot link/note path (which
+      // has no upload/attach stages), so we treat it as recyclable: clear it
+      // and fall through to create. Defensive, mirrors beginImageImport.
+      if (op.status === "complete" && op.itemId !== undefined) {
+        const item = await ctx.db.get(op.itemId);
+        if (item !== null) {
+          return op.itemId;
+        }
+      }
+      // Stale/inconsistent: recycle the row in place for the fresh create below.
+      await ctx.db.patch(op._id, { status: "pending", itemId: undefined });
+    }
+
+    const itemId = await ctx.db.insert("items", {
+      userId,
+      type: kind,
+      status: "processing",
+      ...(kind === "link" ? { url: (fields as { url: string }).url } : {}),
+      ...(kind === "note" ? { note: (fields as { note: string }).note } : {}),
+      tags: [],
+      searchText: "",
+    });
+    if (options.spaceId !== undefined) {
+      await saveIntoSpace(ctx, userId, itemId, options.spaceId);
+    }
+    if (op === null) {
+      await ctx.db.insert("itemOperations", {
+        userId,
+        operationId: options.operationId,
+        kind,
+        status: "complete",
+        itemId,
+        updatedAt: now,
+      });
+    } else {
+      await ctx.db.patch(op._id, {
+        status: "complete",
+        itemId,
+        updatedAt: now,
+      });
+    }
+    await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
+    return itemId;
+  }
+
+  // Ordinary (non-idempotent) path: one item per call, no ledger row.
+  const itemId = await ctx.db.insert("items", {
+    userId,
+    type: kind,
+    status: "processing",
+    ...(kind === "link" ? { url: (fields as { url: string }).url } : {}),
+    ...(kind === "note" ? { note: (fields as { note: string }).note } : {}),
+    tags: [],
+    searchText: "",
+  });
+  if (options.spaceId !== undefined) {
+    await saveIntoSpace(ctx, userId, itemId, options.spaceId);
+  }
+  await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
+  return itemId;
+}
+
 export const createLinkItem = mutation({
-  args: { url: v.string(), spaceId: v.optional(v.id("spaces")) },
+  args: {
+    url: v.string(),
+    spaceId: v.optional(v.id("spaces")),
+    operationId: v.optional(v.string()),
+  },
   returns: v.id("items"),
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
     const url = normalizeUrl(args.url);
-    if (url === "https://") {
-      throw new Error("Invalid URL");
-    }
-    const itemId = await ctx.db.insert("items", {
+    return await createItemWithOperation(
+      ctx,
       userId,
-      type: "link",
-      status: "processing",
-      url,
-      tags: [],
-      searchText: "",
-    });
-    if (args.spaceId !== undefined) {
-      await saveIntoSpace(ctx, userId, itemId, args.spaceId);
-    }
-    await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
-    return itemId;
+      "link",
+      { url },
+      { operationId: args.operationId, spaceId: args.spaceId },
+    );
   },
 });
 
 export const createNoteItem = mutation({
-  args: { text: v.string(), spaceId: v.optional(v.id("spaces")) },
+  args: {
+    text: v.string(),
+    spaceId: v.optional(v.id("spaces")),
+    operationId: v.optional(v.string()),
+  },
   returns: v.id("items"),
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
-    if (args.text.trim() === "") {
-      throw new Error("Note text is empty");
-    }
-    const itemId = await ctx.db.insert("items", {
+    return await createItemWithOperation(
+      ctx,
       userId,
-      type: "note",
-      status: "processing",
-      note: args.text,
-      tags: [],
-      searchText: "",
-    });
-    if (args.spaceId !== undefined) {
-      await saveIntoSpace(ctx, userId, itemId, args.spaceId);
-    }
-    await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
-    return itemId;
+      "note",
+      { note: args.text },
+      { operationId: args.operationId, spaceId: args.spaceId },
+    );
   },
 });
 

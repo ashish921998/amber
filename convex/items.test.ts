@@ -668,3 +668,228 @@ describe("image import lifecycle", () => {
     ).rejects.toThrow();
   });
 });
+
+// Plan 004: shared links and notes use the same operation ledger as images so
+// a share retry never duplicates a saved link/note and never resubmits one.
+// These IDs are deliberately distinct from the image OP_* ids above so a cross-
+// kind mismatch test can reuse the (userId, operationId) namespace cleanly.
+const LINK_OP = "link:33333333-3333-4333-8333-333333333333";
+const NOTE_OP = "note:44444444-4444-4444-8444-444444444444";
+
+describe("shared link/note operation idempotency", () => {
+  it("creates one link for a repeated shared operation and returns the same id", async () => {
+    const t = as("user-a");
+    const firstId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/share",
+      operationId: LINK_OP,
+    });
+    const secondId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/share",
+      operationId: LINK_OP,
+    });
+    expect(secondId).toBe(firstId);
+
+    // Exactly one link item exists for this user.
+    const items = await t.run(async (ctx) => {
+      return await ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-a"))
+        .collect();
+    });
+    expect(items.filter((i) => i.type === "link")).toHaveLength(1);
+  });
+
+  it("creates one note for a repeated shared operation and returns the same id", async () => {
+    const t = as("user-a");
+    const firstId = await t.mutation(api.items.createNoteItem, {
+      text: "shared note",
+      operationId: NOTE_OP,
+    });
+    const secondId = await t.mutation(api.items.createNoteItem, {
+      text: "shared note",
+      operationId: NOTE_OP,
+    });
+    expect(secondId).toBe(firstId);
+
+    const items = await t.run(async (ctx) => {
+      return await ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-a"))
+        .collect();
+    });
+    expect(items.filter((i) => i.type === "note")).toHaveLength(1);
+  });
+
+  it("rejects reusing a link operation id for a note (kind mismatch)", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.createLinkItem, {
+      url: "example.com/kind",
+      operationId: LINK_OP,
+    });
+    await expect(
+      t.mutation(api.items.createNoteItem, {
+        text: "wrong kind",
+        operationId: LINK_OP,
+      }),
+    ).rejects.toThrow(/kind mismatch/i);
+  });
+
+  it("rejects reusing an image operation id for a link", async () => {
+    // Seed a completed image operation directly, then attempt a link create with
+    // the same operation id — the kind guard must reject it.
+    const t = as("user-a");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("itemOperations", {
+        userId: "user-a",
+        operationId: LINK_OP,
+        kind: "image",
+        status: "complete",
+        updatedAt: Date.now(),
+      });
+    });
+    await expect(
+      t.mutation(api.items.createLinkItem, {
+        url: "example.com/clash",
+        operationId: LINK_OP,
+      }),
+    ).rejects.toThrow(/kind mismatch/i);
+  });
+
+  it("isolates the same operation id across users", async () => {
+    const backend = convexTest(schema, modules);
+    const ta = backend.withIdentity({ subject: "user-a" });
+    const tb = backend.withIdentity({ subject: "user-b" });
+
+    const aId = await ta.mutation(api.items.createLinkItem, {
+      url: "example.com/shared",
+      operationId: LINK_OP,
+    });
+    const bId = await tb.mutation(api.items.createLinkItem, {
+      url: "example.com/shared",
+      operationId: LINK_OP,
+    });
+    expect(bId).not.toBe(aId);
+
+    // Each user has their own link item.
+    const aItems = await ta.run(async (ctx) =>
+      ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-a"))
+        .collect(),
+    );
+    const bItems = await tb.run(async (ctx) =>
+      ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-b"))
+        .collect(),
+    );
+    expect(aItems.filter((i) => i.type === "link")).toHaveLength(1);
+    expect(bItems.filter((i) => i.type === "link")).toHaveLength(1);
+  });
+
+  it("creates two intentional items for identical content under distinct operations", async () => {
+    // Idempotency is per-operation, never per-content: the same URL shared twice
+    // (different share sessions) is two deliberate saves, not a deduplicated one.
+    const t = as("user-a");
+    const firstId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/dup",
+      operationId: "link:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    });
+    const secondId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/dup",
+      operationId: "link:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    expect(secondId).not.toBe(firstId);
+
+    const items = await t.run(async (ctx) => {
+      return await ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-a"))
+        .collect();
+    });
+    expect(items.filter((i) => i.type === "link")).toHaveLength(2);
+  });
+
+  it("still creates a fresh item when no operation id is given (Add UI path)", async () => {
+    const t = as("user-a");
+    const firstId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/add",
+    });
+    const secondId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/add",
+    });
+    expect(secondId).not.toBe(firstId);
+
+    // No ledger rows are written on the non-idempotent path.
+    const ops = await t.run(async (ctx) =>
+      ctx.db.query("itemOperations").collect(),
+    );
+    expect(ops).toHaveLength(0);
+  });
+
+  it("releases the link operation when its item is deleted, allowing re-perform", async () => {
+    const t = as("user-a");
+    const itemId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/delete-me",
+      operationId: LINK_OP,
+    });
+    await t.mutation(api.items.deleteItem, { id: itemId });
+
+    // The operation row is gone, so a new share with the same id performs fresh.
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: LINK_OP,
+    });
+    expect(op).toBeNull();
+
+    const redoId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/delete-me",
+      operationId: LINK_OP,
+    });
+    expect(redoId).not.toBe(itemId);
+  });
+
+  it("rejects invalid operation ids on the link/note paths", async () => {
+    const t = as("user-a");
+    await expect(
+      t.mutation(api.items.createLinkItem, {
+        url: "example.com",
+        operationId: "short",
+      }),
+    ).rejects.toThrow(/Invalid operationId/i);
+    await expect(
+      t.mutation(api.items.createNoteItem, {
+        text: "x",
+        operationId: "x".repeat(201),
+      }),
+    ).rejects.toThrow(/Invalid operationId/i);
+  });
+
+  it("rejects empty note text on the idempotent path without completing the op", async () => {
+    const t = as("user-a");
+    await expect(
+      t.mutation(api.items.createNoteItem, {
+        text: "   ",
+        operationId: NOTE_OP,
+      }),
+    ).rejects.toThrow(/empty/i);
+    // No item, no operation row was created.
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: NOTE_OP,
+    });
+    expect(op).toBeNull();
+  });
+
+  it("rejects an invalid url on the idempotent path without completing the op", async () => {
+    const t = as("user-a");
+    await expect(
+      t.mutation(api.items.createLinkItem, {
+        url: "  ",
+        operationId: LINK_OP,
+      }),
+    ).rejects.toThrow(/Invalid URL/i);
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: LINK_OP,
+    });
+    expect(op).toBeNull();
+  });
+});
