@@ -77,11 +77,18 @@ export function useTidyActions({ batch, noteDeleted }: Params) {
             },
           },
         ]);
-        // Plan 005 owns durable Tidy save state. Here we preserve the current
-        // contract: a save resolves to the created itemId, or null on failure
-        // so undo can no-op. The result carries the stable operation id for
-        // that future durability work.
-        return result.status === 'saved' ? result.itemId : null;
+        if (result.status === 'saved') {
+          // Plan 005 owns durable Tidy save state; here we return the created
+          // itemId so undo can delete the item even mid-upload.
+          return result.itemId;
+        }
+        // A settled failure no longer rejects (the hook returns a failed
+        // result instead), so restore the prior behavior explicitly: unmark the
+        // photo so it resurfaces in a future batch, and resolve to null so undo
+        // no-ops. The result carries the stable operation id for plan 005.
+        console.warn('Tidy save failed', result.stage, result.operationId);
+        unmarkReviewed(photo.id);
+        return null;
       })().catch((error) => {
         console.warn('Tidy save failed', error);
         unmarkReviewed(photo.id);

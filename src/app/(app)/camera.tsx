@@ -6,7 +6,7 @@ import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, Text, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, {
@@ -45,9 +45,6 @@ export default function CameraScreen() {
   const saveImages = useSaveImages();
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<CaptureMode>('photo');
-  // Holds the last failed single capture/sticker request so an in-screen retry
-  // reuses its operation id instead of minting a fresh one.
-  const failedRequestRef = useRef<ImageSaveRequest | null>(null);
 
   // Slides the active-label highlight between Photo (0) and Sticker (1).
   const progress = useSharedValue(0);
@@ -147,6 +144,41 @@ export default function CameraScreen() {
     );
   };
 
+  // Saves a single already-built request (used for the initial capture AND for
+  // a retry), reusing the request's operation id verbatim. A retry never
+  // re-captures or mints a fresh id — it replays the exact failed request so
+  // the backend idempotency ledger resumes it.
+  const saveSingle = async (request: ImageSaveRequest) => {
+    setBusy(true);
+    try {
+      const [result] = await saveImages([request], pinnedSpace);
+      if (result.status === 'saved') {
+        router.back();
+        return;
+      }
+      // Preserve the failed request (with its operation id) so the in-screen
+      // retry replays it instead of generating a new one.
+      const failed = { image: result.image, operationId: result.operationId };
+      Alert.alert(
+        'Capture failed',
+        'Could not save that photo. Try again.',
+        [
+          {
+            text: 'Retry',
+            onPress: () => {
+              void saveSingle(failed);
+            },
+          },
+          { text: 'Cancel', onPress: () => setBusy(false) },
+        ],
+      );
+      setBusy(false);
+    } catch {
+      Alert.alert('Capture failed', 'Could not save that photo. Try again.');
+      setBusy(false);
+    }
+  };
+
   const capture = async () => {
     if (busy) return;
     setBusy(true);
@@ -180,32 +212,7 @@ export default function CameraScreen() {
       } else {
         request = { image: { uri } };
       }
-
-      const [result] = await saveImages([request], pinnedSpace);
-      if (result.status === 'saved') {
-        router.back();
-        return;
-      }
-      // Preserve the failed request (with its operation id) so a retry from the
-      // same screen reuses it instead of generating a new one.
-      failedRequestRef.current = { image: result.image, operationId: result.operationId };
-      Alert.alert(
-        'Capture failed',
-        'Could not save that photo. Try again.',
-        [
-          {
-            text: 'Retry',
-            onPress: () => {
-              const failed = failedRequestRef.current;
-              if (!failed) return;
-              failedRequestRef.current = null;
-              void capture();
-            },
-          },
-          { text: 'Cancel', onPress: () => setBusy(false) },
-        ],
-      );
-      setBusy(false);
+      await saveSingle(request);
     } catch {
       Alert.alert('Capture failed', 'Could not take that photo. Try again.');
       setBusy(false);
