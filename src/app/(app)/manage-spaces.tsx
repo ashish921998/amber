@@ -22,31 +22,34 @@ export default function ManageSpacesScreen() {
   const addItemToSpace = useMutation(api.spaces.addItemToSpace);
   const removeItemFromSpace = useMutation(api.spaces.removeItemFromSpace);
 
-  // Optimistic override applied on top of the server-derived membership set so
-  // the switches respond instantly; the membership mutations catch up behind
-  // it. Scoped to the toggles made on this screen — a server-side change from
-  // another flow (e.g. a background suggestion accept) is not reconciled here.
-  // Null means no toggle has happened yet and we render the server value as-is.
-  const [override, setOverride] = useState<Map<Id<'spaces'>, boolean> | null>(null);
+  // Optimistic overrides are keyed by item so a route-param change cannot
+  // apply the previous item's toggles to the next item. Server-side changes
+  // from another flow (e.g. a background suggestion accept) are not reconciled
+  // for the active item.
+  const [override, setOverride] = useState<{
+    itemId: Id<'items'>;
+    values: Map<Id<'spaces'>, boolean>;
+  } | null>(null);
+  const activeOverride = override?.itemId === id ? override.values : null;
   const serverMembers = useMemo(
     () => new Set((item?.spaces ?? []).map((s) => s._id)),
     [item],
   );
   const members = useMemo(() => {
-    if (!override) return serverMembers;
+    if (!activeOverride) return serverMembers;
     const set = new Set(serverMembers);
-    for (const [spaceId, on] of override) {
+    for (const [spaceId, on] of activeOverride) {
       if (on) set.add(spaceId);
       else set.delete(spaceId);
     }
     return set;
-  }, [override, serverMembers]);
+  }, [activeOverride, serverMembers]);
 
   const toggle = (spaceId: Id<'spaces'>, next: boolean) => {
     setOverride((current) => {
-      const map = new Map(current ?? []);
-      map.set(spaceId, next);
-      return map;
+      const values = new Map(current?.itemId === id ? current.values : []);
+      values.set(spaceId, next);
+      return { itemId: id, values };
     });
     if (next) addItemToSpace({ itemId: id, spaceId });
     else removeItemFromSpace({ itemId: id, spaceId });
@@ -65,7 +68,7 @@ export default function ManageSpacesScreen() {
       {loading ? (
         <ActivityIndicator style={styles.spinner} />
       ) : item === null ? (
-        <EmptyState title="Gone" message="This save no longer exists." />
+        <EmptyState title="Unavailable" message="This save is unavailable." />
       ) : spaces.length === 0 ? (
         <Text style={styles.empty}>
           No spaces yet — create one from the Spaces tab.
