@@ -22,8 +22,10 @@ export default function ManageSpacesScreen() {
   const removeItemFromSpace = useMutation(api.spaces.removeItemFromSpace);
 
   // Optimistic override applied on top of the server-derived membership set so
-  // the switches respond instantly; Convex confirms behind it. Null means no
-  // toggle has happened yet and we render the server value as-is.
+  // the switches respond instantly; the membership mutations catch up behind
+  // it. Scoped to the toggles made on this screen — a server-side change from
+  // another flow (e.g. a background suggestion accept) is not reconciled here.
+  // Null means no toggle has happened yet and we render the server value as-is.
   const [override, setOverride] = useState<Map<Id<'spaces'>, boolean> | null>(null);
   const serverMembers = useMemo(
     () => new Set((item?.spaces ?? []).map((s) => s._id)),
