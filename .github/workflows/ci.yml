@@ -12,6 +12,10 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # No later step needs git auth; don't leave the token in local git
+          # config where install/build scripts could read it.
+          persist-credentials: false
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2

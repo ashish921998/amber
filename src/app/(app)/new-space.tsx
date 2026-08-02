@@ -41,6 +41,17 @@ export default function NewSpaceScreen() {
     );
   }
 
+  // A null result means the space was deleted, isn't ours, or the link is stale.
+  // Bail to a not-found state instead of rendering the create form and silently
+  // making a new space when the user hits save.
+  if (editing && space === null) {
+    return (
+      <View style={styles.loading}>
+        <Text>This space is no longer available.</Text>
+      </View>
+    );
+  }
+
   return (
     <SpaceForm
       key={editing ? (space?._id ?? id) : 'new'}
