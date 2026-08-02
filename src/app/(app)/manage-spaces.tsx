@@ -5,7 +5,7 @@ import { convexQuery } from '@convex-dev/react-query';
 import { useQuery } from '@tanstack/react-query';
 import { useMutation } from 'convex/react';
 import { useLocalSearchParams } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 
@@ -21,27 +21,35 @@ export default function ManageSpacesScreen() {
   const addItemToSpace = useMutation(api.spaces.addItemToSpace);
   const removeItemFromSpace = useMutation(api.spaces.removeItemFromSpace);
 
-  // Local mirror of the memberships so the switches respond instantly; the
-  // mutations catch up behind it (Convex confirms in the background).
-  const [members, setMembers] = useState<Set<string> | null>(null);
-  useEffect(() => {
-    if (item && members === null) {
-      setMembers(new Set(item.spaces.map((s) => s._id)));
+  // Optimistic override applied on top of the server-derived membership set so
+  // the switches respond instantly; Convex confirms behind it. Null means no
+  // toggle has happened yet and we render the server value as-is.
+  const [override, setOverride] = useState<Map<Id<'spaces'>, boolean> | null>(null);
+  const serverMembers = useMemo(
+    () => new Set((item?.spaces ?? []).map((s) => s._id)),
+    [item],
+  );
+  const members = useMemo(() => {
+    if (!override) return serverMembers;
+    const set = new Set(serverMembers);
+    for (const [spaceId, on] of override) {
+      if (on) set.add(spaceId);
+      else set.delete(spaceId);
     }
-  }, [item, members]);
+    return set;
+  }, [override, serverMembers]);
 
   const toggle = (spaceId: Id<'spaces'>, next: boolean) => {
-    setMembers((current) => {
-      const set = new Set(current);
-      if (next) set.add(spaceId);
-      else set.delete(spaceId);
-      return set;
+    setOverride((current) => {
+      const map = new Map(current ?? []);
+      map.set(spaceId, next);
+      return map;
     });
     if (next) addItemToSpace({ itemId: id, spaceId });
     else removeItemFromSpace({ itemId: id, spaceId });
   };
 
-  const loading = spaces === undefined || members === null;
+  const loading = spaces === undefined || item === undefined;
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
