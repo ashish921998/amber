@@ -202,11 +202,12 @@ Replace the spinner-only `share.tsx` UI:
   remount reconciliation retries the clear — and replace Home exactly once.
 
 On `Continue with saved`, persist complete before clearing; explain that failed
-entries will be discarded. On `Cancel`, do not claim success; Cancel is
-terminal and runs the same persist-terminal-phase → native clear → delete-session
-sequence as completion, so a later identical re-share never matches a stale
-session. Navigation and clear must be centralized in one idempotent completion
-function.
+entries will be discarded. On `Cancel`, do not claim success, but run the exact
+same completion path — persist `phase: complete` → native clear → delete-session
+— so the crash-window reconciliation (matching complete session clears and
+deletes) applies unchanged and a later identical re-share never matches a stale
+session. Cancel introduces no new phase value. Navigation and clear must be
+centralized in one idempotent completion function.
 
 Use existing theme typography/buttons rather than adding a design system.
 
