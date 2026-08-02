@@ -67,14 +67,15 @@ export default function ItemScreen() {
 
   // Mirror the space screen's feed order exactly (suggestions first, then
   // saved) so swiping pages through what the user saw in the grid.
-  const list: DetailItem[] | undefined =
-    from === 'space'
-      ? spaceQ.data
+  const list = useMemo<DetailItem[] | undefined>(() => {
+    if (from === 'space') {
+      return spaceQ.data
         ? [...spaceQ.data.suggestions, ...spaceQ.data.items]
-        : undefined
-      : from === 'search'
-        ? searchQ.data
-        : listQ.data;
+        : undefined;
+    }
+    if (from === 'search') return searchQ.data;
+    return listQ.data;
+  }, [from, spaceQ.data, searchQ.data, listQ.data]);
 
   const suggestedIds = useMemo(
     () => new Set(spaceQ.data?.suggestions.map((i) => i._id) ?? []),
@@ -101,7 +102,6 @@ export default function ItemScreen() {
   // so swiping (which rewrites the `id` param) never re-pairs the transition.
   const [pushedId] = useState(id);
   const [activeId, setActiveId] = useState(id);
-  const [editing, setEditing] = useState(false);
 
   // Keeping the route `id` param in sync writes navigation state, which
   // re-renders the entire native-stack tree — a ~16ms cascade profiled as the

@@ -1,11 +1,12 @@
 import { AnimatedSwitch } from '@/components/ui/animated-switch';
+import { EmptyState } from '@/components/empty-state';
 import { api } from '@convex/_generated/api';
 import type { Id } from '@convex/_generated/dataModel';
 import { convexQuery } from '@convex-dev/react-query';
 import { useQuery } from '@tanstack/react-query';
 import { useMutation } from 'convex/react';
 import { useLocalSearchParams } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import { StyleSheet } from 'react-native-unistyles';
 
@@ -21,27 +22,43 @@ export default function ManageSpacesScreen() {
   const addItemToSpace = useMutation(api.spaces.addItemToSpace);
   const removeItemFromSpace = useMutation(api.spaces.removeItemFromSpace);
 
-  // Local mirror of the memberships so the switches respond instantly; the
-  // mutations catch up behind it (Convex confirms in the background).
-  const [members, setMembers] = useState<Set<string> | null>(null);
-  useEffect(() => {
-    if (item && members === null) {
-      setMembers(new Set(item.spaces.map((s) => s._id)));
+  // Optimistic overrides are keyed by item so a route-param change cannot
+  // apply the previous item's toggles to the next item. Server-side changes
+  // from another flow (e.g. a background suggestion accept) are not reconciled
+  // for the active item.
+  const [override, setOverride] = useState<{
+    itemId: Id<'items'>;
+    values: Map<Id<'spaces'>, boolean>;
+  } | null>(null);
+  const activeOverride = override?.itemId === id ? override.values : null;
+  const serverMembers = useMemo(
+    () => new Set((item?.spaces ?? []).map((s) => s._id)),
+    [item],
+  );
+  const members = useMemo(() => {
+    if (!activeOverride) return serverMembers;
+    const set = new Set(serverMembers);
+    for (const [spaceId, on] of activeOverride) {
+      if (on) set.add(spaceId);
+      else set.delete(spaceId);
     }
-  }, [item, members]);
+    return set;
+  }, [activeOverride, serverMembers]);
 
   const toggle = (spaceId: Id<'spaces'>, next: boolean) => {
-    setMembers((current) => {
-      const set = new Set(current);
-      if (next) set.add(spaceId);
-      else set.delete(spaceId);
-      return set;
+    setOverride((current) => {
+      const values = new Map(current?.itemId === id ? current.values : []);
+      values.set(spaceId, next);
+      return { itemId: id, values };
     });
     if (next) addItemToSpace({ itemId: id, spaceId });
     else removeItemFromSpace({ itemId: id, spaceId });
   };
 
-  const loading = spaces === undefined || members === null;
+  // The item may be `null` (deleted, or not ours) — distinct from `undefined`
+  // (still loading). A null item renders a non-interactive state instead of an
+  // all-off switch list, since every toggle would fire a failing mutation.
+  const loading = spaces === undefined || item === undefined;
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
@@ -50,6 +67,8 @@ export default function ManageSpacesScreen() {
 
       {loading ? (
         <ActivityIndicator style={styles.spinner} />
+      ) : item === null ? (
+        <EmptyState title="Unavailable" message="This save is unavailable." />
       ) : spaces.length === 0 ? (
         <Text style={styles.empty}>
           No spaces yet — create one from the Spaces tab.
