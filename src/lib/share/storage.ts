@@ -96,7 +96,7 @@ const ENTRY_STATUSES = new Set<ShareEntryStatus>([
 ]);
 const ENTRY_KINDS = new Set<ShareEntryKind>(['link', 'note', 'image', 'unsupported']);
 
-const SESSION_KEY = 'incoming-share-session';
+export const SESSION_KEY = 'incoming-share-session';
 
 // ---------------------------------------------------------------------------
 // Fingerprinting

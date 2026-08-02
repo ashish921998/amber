@@ -12,6 +12,7 @@ import {
   markComplete,
   operationIdFor,
   reconcileSession,
+  SESSION_KEY,
   SESSION_SCHEMA_VERSION,
   updateEntry,
   type SessionStoreAdapter,
@@ -230,21 +231,21 @@ describe("reconcileSession", () => {
 describe("loadSession", () => {
   it("drops an incompatible (future) schema version rather than misinterpreting it", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({ version: 999 }));
+    store.set(SESSION_KEY, JSON.stringify({ version: 999 }));
     expect(loadSession(store)).toBeNull();
     // The corrupt record was removed so the next reconcile starts clean.
-    expect(store.contains("incoming-share-session")).toBe(false);
+    expect(store.contains(SESSION_KEY)).toBe(false);
   });
 
   it("drops unparseable JSON", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", "{not json");
+    store.set(SESSION_KEY, "{not json");
     expect(loadSession(store)).toBeNull();
   });
 
   it("drops a session missing required fields", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({ version: 1 }));
+    store.set(SESSION_KEY, JSON.stringify({ version: 1 }));
     expect(loadSession(store)).toBeNull();
   });
 });
@@ -368,7 +369,7 @@ describe("user-scoped sessions (account switching)", () => {
 describe("entry validation in loadSession", () => {
   it("drops a session containing a malformed entry ({}) instead of trusting it", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({
+    store.set(SESSION_KEY, JSON.stringify({
       version: SESSION_SCHEMA_VERSION,
       fingerprint: "fp",
       userId: USER,
@@ -377,12 +378,12 @@ describe("entry validation in loadSession", () => {
       entries: [{}],
     }));
     expect(loadSession(store)).toBeNull();
-    expect(store.contains("incoming-share-session")).toBe(false);
+    expect(store.contains(SESSION_KEY)).toBe(false);
   });
 
   it("drops a session whose entry has an out-of-set status", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({
+    store.set(SESSION_KEY, JSON.stringify({
       version: SESSION_SCHEMA_VERSION,
       fingerprint: "fp",
       userId: USER,
@@ -395,9 +396,24 @@ describe("entry validation in loadSession", () => {
     expect(loadSession(store)).toBeNull();
   });
 
+  it("drops a session whose entry has a kind outside ENTRY_KINDS", () => {
+    const store = memoryStore();
+    store.set(SESSION_KEY, JSON.stringify({
+      version: SESSION_SCHEMA_VERSION,
+      fingerprint: "fp",
+      userId: USER,
+      sessionId: "sess-x",
+      phase: "active",
+      entries: [
+        { index: 0, operationId: "share:sess-x:0", kind: "garbage", status: "pending" },
+      ],
+    }));
+    expect(loadSession(store)).toBeNull();
+  });
+
   it("drops a session whose entry has a non-integer index", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({
+    store.set(SESSION_KEY, JSON.stringify({
       version: SESSION_SCHEMA_VERSION,
       fingerprint: "fp",
       userId: USER,
@@ -412,7 +428,7 @@ describe("entry validation in loadSession", () => {
 
   it("drops a session whose entry has an empty operationId", () => {
     const store = memoryStore();
-    store.set("incoming-share-session", JSON.stringify({
+    store.set(SESSION_KEY, JSON.stringify({
       version: SESSION_SCHEMA_VERSION,
       fingerprint: "fp",
       userId: USER,

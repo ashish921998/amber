@@ -165,7 +165,11 @@ export async function processSession(
       // attempted for the first time. Both go through the same path.
 
       const settled = await processOne(entry, resolved, deps);
-      // Merge the settled outcome onto this entry.
+      // Merge the settled outcome onto this entry, including the re-derived kind.
+      // On a resume where classifyEntries did not run (a sibling was already
+      // settled), a pending entry may still carry its placeholder kind:'link';
+      // persisting settled.kind corrects it rather than leaving the wrong kind.
+      entry.kind = settled.kind;
       entry.status = settled.status;
       entry.itemId = settled.itemId;
       entry.message = settled.message;
@@ -187,27 +191,31 @@ export async function processSession(
  * pointless round-trip that overwrites the classifier's friendly message with
  * a generic one. classifyPayload is the single source of truth for kind + the
  * malformed reason; processOne honors its terminal verdicts without invoking a
- * save. */
+ * save. The re-derived kind is returned so processSession can correct a
+ * persisted placeholder kind (e.g. a pending entry that crashed before its
+ * classified kind was ever persisted) on resume. */
 async function processOne(
   entry: ShareEntry,
   resolved: ResolvedPayload[],
   deps: ShareSaveDeps,
-): Promise<Partial<ShareEntry> & { status: ShareEntry['status'] }> {
+): Promise<Partial<ShareEntry> & { kind: ShareEntryKind; status: ShareEntry['status'] }> {
   const payload = resolved[entry.index];
   const operationId = entry.operationId;
 
   // Re-derive kind + malformed-ness from the resolved payload. If the payload
   // is absent (raw/resolved divergence not caught earlier) or malformed, fail
   // WITHOUT a backend call — no empty link/note item, no wasted round-trip.
+  // The re-derived kind is still returned so the caller can correct a stale
+  // placeholder kind persisted before a crash.
   if (payload === undefined) {
-    return { status: 'failed', message: 'No resolved payload for this entry' };
+    return { kind: entry.kind, status: 'failed', message: 'No resolved payload for this entry' };
   }
   const { kind, reason } = classifyPayload(payload);
   if (reason !== undefined) {
     // A saveable kind with a malformed payload (blank website/text, image with
     // no contentUri) is terminal; an unsupported type is terminal too.
     const status: ShareEntry['status'] = kind === 'unsupported' ? 'unsupported' : 'failed';
-    return { status, message: reason };
+    return { kind, status, message: reason };
   }
 
   try {
@@ -216,14 +224,14 @@ async function processOne(
         url: payload.value.trim(),
         operationId,
       });
-      return { status: 'saved', itemId: String(itemId), message: undefined };
+      return { kind, status: 'saved', itemId: String(itemId), message: undefined };
     }
     if (kind === 'note') {
       const itemId = await deps.saveNote({
         text: payload.value.trim(),
         operationId,
       });
-      return { status: 'saved', itemId: String(itemId), message: undefined };
+      return { kind, status: 'saved', itemId: String(itemId), message: undefined };
     }
     // kind === 'image' (classifyPayload guarantees contentUri when no reason).
     const image: LocalImage = {
@@ -232,11 +240,12 @@ async function processOne(
     };
     const result = await deps.saveImage({ image, operationId });
     if (result.status === 'saved') {
-      return { status: 'saved', itemId: String(result.itemId), message: undefined };
+      return { kind, status: 'saved', itemId: String(result.itemId), message: undefined };
     }
-    return { status: 'failed', message: result.message };
+    return { kind, status: 'failed', message: result.message };
   } catch (error) {
     return {
+      kind,
       status: 'failed',
       message: userSafeMessage(error),
     };

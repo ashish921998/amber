@@ -374,6 +374,37 @@ describe("processSession", () => {
     expect(saveLink).not.toHaveBeenCalled();
   });
 
+  it("corrects a stale placeholder kind to the re-derived kind on resume", async () => {
+    // Regression: on a resume where classifyEntries does not run (a sibling was
+    // already settled so fresh=false), a pending entry may still carry its
+    // placeholder kind:'link'. processOne re-derives the real kind; processSession
+    // must merge that kind into the settled entry so the persisted record is
+    // corrected — otherwise a crash here would leave a permanently wrong kind.
+    const session = makeSession(1);
+    const resolved = [imagePayload("file://img.jpg")];
+    // Persisted state: placeholder kind:'link', still pending.
+    const persistedPending: ShareEntry[] = [
+      { ...session.entries[0], kind: "link", status: "pending" },
+    ];
+    const deps = makeDeps({
+      saveImage: async ({ operationId }) => ({
+        status: "saved" as const,
+        operationId,
+        image: { uri: "file://img.jpg" },
+        itemId: "items:image-kind-fix" as Id<"items">,
+      }),
+    });
+
+    const result = await processSession(
+      { ...session, entries: persistedPending },
+      resolved,
+      deps,
+    );
+    // The settled kind is corrected to 'image', not left as the 'link' placeholder.
+    expect(result.entries[0].kind).toBe("image");
+    expect(result.entries[0].status).toBe("saved");
+  });
+
   it("fails an image with no contentUri without a backend call", async () => {
     const session = makeSession(1);
     const resolved = [imagePayload(null)];
