@@ -12,13 +12,19 @@
 //      must never share a fingerprint, so a deliberate later re-share of
 //      identical content is its own fresh session rather than matching a stale
 //      completed one.
-//   2. reconcileSession(rawPayloads) — returns exactly one of:
-//        { kind: 'new', session }          start a brand-new session for this batch
-//        { kind: 'resume', session }        same batch as an active session: retry pending/failed
-//        { kind: 'clear', session }         same batch as a COMPLETED session: clear native
-//                                           payloads, then the record is deleted here
-//        { kind: 'empty' }                  no raw payloads: drop any stale local session
-//   3. markEntry / markComplete — mutate the persisted session in place.
+//   2. reconcileSession(userId, rawPayloads) — returns exactly one of:
+//        { kind: 'new', session }     start a brand-new session for this batch
+//        { kind: 'resume', session }  same batch + user as an active session: retry pending/failed
+//        { kind: 'clear', session }   same batch + user as a COMPLETED session: clear native
+//                                     payloads. NOTE: reconcileSession does NOT delete the record
+//                                     here — a throwing clear must stay retryable on remount, so
+//                                     the caller deletes it only after a non-throwing clear.
+//        { kind: 'empty' }            no raw payloads: drop any stale local session
+//      Sessions are scoped to userId: a record left by a different user (account
+//      switch) is treated as no session, never matched.
+//   3. updateEntry / markComplete / deleteSession — mutate the persisted session
+//      in place. Each takes an optional sessionId scope so an in-flight run whose
+//      record was replaced mid-flight cannot mutate the newer session.
 
 /** A synchronous string-keyed bag, the slice of MMKV the session store needs.
  * Injecting it keeps this module unit-testable with a plain Map and lets a
