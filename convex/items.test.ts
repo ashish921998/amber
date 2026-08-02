@@ -827,6 +827,51 @@ describe("shared link/note operation idempotency", () => {
     expect(ops).toHaveLength(0);
   });
 
+  it("schedules processItem exactly once per link/note create, on both paths", async () => {
+    // Regression: the operation-guarded path used to call insertLinkOrNote
+    // (which schedules processItem) AND then schedule processItem again itself,
+    // running the AI pipeline twice and racing two concurrent classifications.
+    // Both the guarded (operationId) and ordinary paths must schedule exactly
+    // one processItem job for the created item — no more.
+    const t = as("user-a");
+
+    // Guarded path (share flow).
+    const guardedId = await t.mutation(api.items.createLinkItem, {
+      url: "example.com/guarded",
+      operationId: LINK_OP,
+    });
+    // Ordinary path (Add UI).
+    const plainId = await t.mutation(api.items.createNoteItem, {
+      text: "plain note",
+    });
+
+    const scheduled = await t.run(async (ctx) =>
+      ctx.db.system.query("_scheduled_functions").collect(),
+    );
+    const processJobs = scheduled.filter((j) => j.name === "ai:processItem");
+    // Exactly two jobs total — one per create — and each targets its own item.
+    expect(processJobs).toHaveLength(2);
+    const targeted = processJobs.flatMap((j) =>
+      // args is stored as a single-element array wrapping the mutation args.
+      (j.args as unknown as { itemId: Id<"items"> }[]).map((a) => a.itemId),
+    );
+    expect(targeted).toContain(guardedId);
+    expect(targeted).toContain(plainId);
+
+    // A repeat create on the completed guarded operation (idempotent hit) must
+    // NOT schedule processItem again — the item already exists and was processed.
+    await t.mutation(api.items.createLinkItem, {
+      url: "example.com/guarded",
+      operationId: LINK_OP,
+    });
+    const scheduledAfter = await t.run(async (ctx) =>
+      ctx.db.system.query("_scheduled_functions").collect(),
+    );
+    expect(
+      scheduledAfter.filter((j) => j.name === "ai:processItem"),
+    ).toHaveLength(2);
+  });
+
   it("releases the link operation when its item is deleted, allowing re-perform", async () => {
     const t = as("user-a");
     const itemId = await t.mutation(api.items.createLinkItem, {

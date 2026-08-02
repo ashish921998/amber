@@ -836,7 +836,10 @@ async function createItemWithOperation(
         updatedAt: now,
       });
     }
-    await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
+    // processItem is scheduled exactly once per create — inside
+    // insertLinkOrNote above. Do NOT schedule it again here: a second schedule
+    // would run the AI pipeline twice on the same item, wasting cost and racing
+    // two concurrent classifications against each other.
     return itemId;
   }
 
