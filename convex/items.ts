@@ -292,18 +292,326 @@ async function saveIntoSpace(
   });
 }
 
-export const generateUploadUrl = mutation({
-  args: {},
-  returns: v.string(),
-  handler: async (ctx) => {
-    await requireUserId(ctx);
-    return await ctx.storage.generateUploadUrl();
+// ---------------------------------------------------------------------------
+// Image import operation ledger
+// ---------------------------------------------------------------------------
+//
+// Idempotent image save with a stable per-image operation ID so a retry never
+// duplicates a success and never resubmits one. The client flow is:
+//
+//   begin  -> { uploadUrl } (or { itemId } if already finalized)
+//   upload bytes to the upload URL out-of-band (outside the Convex txn)
+//   attach -> records the storageId on the pending operation
+//   finalize -> validates metadata and atomically inserts the item + completes
+//
+// Correctness goal is idempotency + compensation, NOT upload+DB atomicity: a
+// process can crash after the upload succeeds but before `attach` records the
+// storageId. In that gap the blob's id was never written anywhere, so nothing
+// — including the stale-pending cleanup cron, which only sees storageIds
+// recorded on ledger rows — can ever reclaim it. That narrow window leaks the
+// blob permanently; it is documented and accepted, not eliminated.
+
+/** Operation IDs are opaque client UUIDs (optionally prefixed for logs). This
+ * bounds length so a stray empty/huge string can't pollute the index. */
+const OPERATION_ID_MIN = 8;
+const OPERATION_ID_MAX = 200;
+
+function requireOperationId(operationId: string): void {
+  if (
+    typeof operationId !== "string" ||
+    operationId.length < OPERATION_ID_MIN ||
+    operationId.length > OPERATION_ID_MAX
+  ) {
+    throw new Error("Invalid operationId");
+  }
+}
+
+/** Loads the caller's image operation for `operationId`, or null. The (userId,
+ * operationId) pair is the logical unique key — never look one up without both.
+ * Callers that expect a specific `kind` must pass it so a reused operation ID
+ * can't silently switch from image to link/note. */
+async function loadImageOperation(
+  ctx: QueryCtx | MutationCtx,
+  userId: string,
+  operationId: string,
+  kind: "image" | "link" | "note" = "image",
+): Promise<Doc<"itemOperations"> | null> {
+  const op = await ctx.db
+    .query("itemOperations")
+    .withIndex("by_user_operation", (q) =>
+      q.eq("userId", userId).eq("operationId", operationId),
+    )
+    .unique();
+  if (op === null) {
+    return null;
+  }
+  if (op.kind !== kind) {
+    throw new Error("Operation kind mismatch");
+  }
+  return op;
+}
+
+const STORAGE_IN_USE = "Storage object is already in use";
+
+/** True iff neither an item nor any OTHER operation references `storageId`.
+ * attach/cleanup use this to make a storage id deletable/adoptable ONLY when it
+ * is a fresh, unreferenced upload (a redundant retry re-upload) — never a blob
+ * an item or another in-flight operation depends on. Checking `itemOperations`
+ * too closes the double-adopt hole: without it the same blob could be adopted
+ * into two operations, finalize into two items sharing one blob, and then be
+ * destroyed for the survivor when either item is deleted.
+ *
+ * KNOWN RESIDUAL (plan 003 STOP condition): this does NOT bind a storage id to
+ * (userId, operationId). A blob that a client has POSTed but not yet attached
+ * is referenced by nothing, so it passes here — meaning an authenticated
+ * caller who somehow learns another user's still-un-attached storage id could
+ * adopt or delete it within the brief upload→attach window. The direct-upload
+ * API gives no server-verifiable binding to close this; exposure is limited by
+ * Convex storage ids being unguessable and never surfaced to other users. A
+ * true fix requires server-mediated upload completion — tracked, not done. */
+async function isStorageUnreferenced(
+  ctx: MutationCtx,
+  storageId: Id<"_storage">,
+  excludeOperation?: Id<"itemOperations">,
+): Promise<boolean> {
+  const item = await ctx.db
+    .query("items")
+    .withIndex("by_storage", (q) => q.eq("storageId", storageId))
+    .first();
+  if (item !== null) {
+    return false;
+  }
+  const ops = await ctx.db
+    .query("itemOperations")
+    .withIndex("by_storage", (q) => q.eq("storageId", storageId))
+    .take(2);
+  return ops.every((op) => op._id === excludeOperation);
+}
+
+/** Deletes a storage object iff it still exists. `ctx.storage.delete` throws on
+ * a missing file, and several callers here run inside transactional sweeps or
+ * recycle paths where one dangling reference must not wedge the whole mutation
+ * (the cron re-reads the same oldest page every run, so a single poisoned row
+ * would halt cleanup permanently). */
+async function safeDeleteStorage(
+  ctx: MutationCtx,
+  storageId: Id<"_storage">,
+): Promise<void> {
+  const exists = await ctx.db.system.get("_storage", storageId);
+  if (exists !== null) {
+    await ctx.storage.delete(storageId);
+  }
+}
+
+/** Discriminated return for beginImageImport. A named type (rather than inline
+ * object literals) keeps `kind` a literal so the `returns` validator matches. */
+type BeginImageImportResult =
+  | { kind: "upload"; uploadUrl: string }
+  | { kind: "complete"; itemId: Id<"items"> };
+
+/** Validates image metadata exactly as the legacy createImageItem did, so
+ * finalize rejects bad input without marking the operation complete. */
+function validateImageMetadata(args: {
+  aspectRatio?: number;
+  latitude?: number;
+  longitude?: number;
+}): void {
+  if (
+    args.aspectRatio !== undefined &&
+    (!Number.isFinite(args.aspectRatio) || args.aspectRatio <= 0)
+  ) {
+    throw new Error("Invalid aspectRatio");
+  }
+  // Location is all-or-nothing: a lone latitude can't be plotted.
+  const hasLocation =
+    args.latitude !== undefined && args.longitude !== undefined;
+  if (
+    (args.latitude !== undefined || args.longitude !== undefined) &&
+    (!hasLocation ||
+      !Number.isFinite(args.latitude) ||
+      Math.abs(args.latitude!) > 90 ||
+      !Number.isFinite(args.longitude) ||
+      Math.abs(args.longitude!) > 180)
+  ) {
+    throw new Error("Invalid location");
+  }
+}
+
+export const beginImageImport = mutation({
+  args: { operationId: v.string() },
+  returns: v.union(
+    v.object({ kind: v.literal("upload"), uploadUrl: v.string() }),
+    v.object({ kind: v.literal("complete"), itemId: v.id("items") }),
+  ),
+  handler: async (ctx, args): Promise<BeginImageImportResult> => {
+    const userId = await requireUserId(ctx);
+    requireOperationId(args.operationId);
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const now = Date.now();
+
+    if (op === null) {
+      // (userId, operationId) uniqueness is enforced by Convex's serializable
+      // transactions: if two begins race on an empty index range, only one
+      // insert commits; the other's transaction is retried and will observe
+      // the row above as a pending op. No application-level unique index exists
+      // because Convex has no unique secondary indexes — this OCC + retry is
+      // the supported idiom.
+      await ctx.db.insert("itemOperations", {
+        userId,
+        operationId: args.operationId,
+        kind: "image",
+        status: "pending",
+        updatedAt: now,
+      });
+      return {
+        kind: "upload",
+        uploadUrl: await ctx.storage.generateUploadUrl(),
+      };
+    }
+
+    if (op.status === "complete") {
+      // A complete operation whose item was explicitly deleted is recyclable:
+      // reset to pending so the durable operationId performs a fresh save.
+      if (op.itemId !== undefined) {
+        const item = await ctx.db.get(op.itemId);
+        if (item === null) {
+          // Release the now-orphaned storage object before resetting the row,
+          // otherwise the blob leaks (the cleanup cron only sweeps pending
+          // rows, and this row is currently complete). Guarded so a blob some
+          // other item/operation still depends on — or one already deleted —
+          // can't corrupt them or wedge this recycle path.
+          if (
+            op.storageId !== undefined &&
+            (await isStorageUnreferenced(ctx, op.storageId, op._id))
+          ) {
+            await safeDeleteStorage(ctx, op.storageId);
+          }
+          await ctx.db.patch(op._id, {
+            status: "pending",
+            itemId: undefined,
+            storageId: undefined,
+            updatedAt: now,
+          });
+          return {
+            kind: "upload",
+            uploadUrl: await ctx.storage.generateUploadUrl(),
+          };
+        }
+        return { kind: "complete", itemId: op.itemId };
+      }
+      // Defensive: a complete row with no itemId is inconsistent; recycle it
+      // the same way as above — release the blob (guarded) and CLEAR the stale
+      // storageId, otherwise attach would treat it as canonical and delete the
+      // fresh re-upload as "redundant".
+      if (
+        op.storageId !== undefined &&
+        (await isStorageUnreferenced(ctx, op.storageId, op._id))
+      ) {
+        await safeDeleteStorage(ctx, op.storageId);
+      }
+      await ctx.db.patch(op._id, {
+        status: "pending",
+        storageId: undefined,
+        updatedAt: now,
+      });
+      return {
+        kind: "upload",
+        uploadUrl: await ctx.storage.generateUploadUrl(),
+      };
+    }
+
+    // Pending: refresh updatedAt (a begin is active interest) and hand back a
+    // fresh URL. A retry that re-uploads is correct-by-design — attach keeps
+    // the first storageId and discards the redundant blob.
+    await ctx.db.patch(op._id, { updatedAt: now });
+    return {
+      kind: "upload",
+      uploadUrl: await ctx.storage.generateUploadUrl(),
+    };
   },
 });
 
-export const createImageItem = mutation({
+export const attachImageUpload = mutation({
   args: {
+    operationId: v.string(),
     storageId: v.id("_storage"),
+  },
+  returns: v.object({ storageId: v.id("_storage") }),
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    requireOperationId(args.operationId);
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const now = Date.now();
+
+    if (op === null) {
+      // No begin happened (or the row was swept). Adopt the caller's storage id
+      // only if the blob actually exists (a swept id must not become an item
+      // with a permanently dead image) and isn't referenced by an item or
+      // another operation. NOTE: existence + unreferenced is NOT proof the
+      // caller owns this blob during the un-attached window — see the residual
+      // documented on isStorageUnreferenced.
+      if ((await ctx.db.system.get("_storage", args.storageId)) === null) {
+        throw new Error("Storage object not found");
+      }
+      if (!(await isStorageUnreferenced(ctx, args.storageId))) {
+        throw new Error(STORAGE_IN_USE);
+      }
+      await ctx.db.insert("itemOperations", {
+        userId,
+        operationId: args.operationId,
+        kind: "image",
+        status: "pending",
+        storageId: args.storageId,
+        updatedAt: now,
+      });
+      return { storageId: args.storageId };
+    }
+
+    if (op.status === "complete") {
+      // Already finalized (a racing retry lost to the original's finalize).
+      // Return the canonical id, and delete the retry's redundant re-upload —
+      // otherwise it is referenced by nothing (no item, no ledger row) and the
+      // pending-only cleanup cron would never reclaim it. The unreferenced
+      // guard keeps a blob some other item/operation owns safe.
+      if (
+        args.storageId !== op.storageId &&
+        (await isStorageUnreferenced(ctx, args.storageId))
+      ) {
+        await safeDeleteStorage(ctx, args.storageId);
+      }
+      return { storageId: (op.storageId ?? args.storageId) };
+    }
+
+    // First attachment wins. A racing retry that supplies a different storageId
+    // has re-uploaded redundantly; delete the REDUNDANT (incoming) blob — but
+    // only if it is unreferenced, so a client can never delete storage it
+    // doesn't own (e.g. another user's blob or another operation's pending
+    // upload).
+    if (op.storageId !== undefined && op.storageId !== args.storageId) {
+      if (await isStorageUnreferenced(ctx, args.storageId)) {
+        await safeDeleteStorage(ctx, args.storageId);
+      }
+      await ctx.db.patch(op._id, { updatedAt: now });
+      return { storageId: op.storageId };
+    }
+    // No canonical id yet, or the caller re-sent the same id: adopt it, with
+    // the same existence and unreferenced defenses as the no-begin path.
+    if (op.storageId === undefined) {
+      if ((await ctx.db.system.get("_storage", args.storageId)) === null) {
+        throw new Error("Storage object not found");
+      }
+      if (!(await isStorageUnreferenced(ctx, args.storageId))) {
+        throw new Error(STORAGE_IN_USE);
+      }
+    }
+    await ctx.db.patch(op._id, { storageId: args.storageId, updatedAt: now });
+    return { storageId: args.storageId };
+  },
+});
+
+export const finalizeImageImport = mutation({
+  args: {
+    operationId: v.string(),
     aspectRatio: v.optional(v.number()),
     isSticker: v.optional(v.boolean()),
     capturedAt: v.optional(v.number()),
@@ -314,30 +622,39 @@ export const createImageItem = mutation({
   returns: v.id("items"),
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
-    if (
-      args.aspectRatio !== undefined &&
-      (!Number.isFinite(args.aspectRatio) || args.aspectRatio <= 0)
-    ) {
-      throw new Error("Invalid aspectRatio");
+    requireOperationId(args.operationId);
+
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+
+    // Already complete — return the original live item id WITHOUT validating
+    // the resubmitted metadata. The idempotent read path must not be gated on
+    // the caller resending identical valid fields; a completed import is final.
+    // (A complete row pointing at a deleted item should have been recycled by
+    // begin; if we reach here, treat it as complete with the recorded id.)
+    if (op !== null && op.status === "complete" && op.itemId !== undefined) {
+      return op.itemId;
     }
-    // Location is all-or-nothing: a lone latitude can't be plotted.
-    const hasLocation =
-      args.latitude !== undefined && args.longitude !== undefined;
-    if (
-      (args.latitude !== undefined || args.longitude !== undefined) &&
-      (!hasLocation ||
-        !Number.isFinite(args.latitude) ||
-        Math.abs(args.latitude!) > 90 ||
-        !Number.isFinite(args.longitude) ||
-        Math.abs(args.longitude!) > 180)
-    ) {
-      throw new Error("Invalid location");
+
+    // Validate BEFORE touching the ledger: invalid metadata must not mark the
+    // operation complete, so the caller can retry with corrected input.
+    validateImageMetadata(args);
+
+    if (op === null) {
+      // The caller skipped begin (or the row was swept). We have no storageId
+      // to attach, so this is an invalid import attempt.
+      throw new Error("Operation has no attached upload");
     }
+    if (op.storageId === undefined) {
+      // begin succeeded but attach never ran (process died between upload and
+      // attach). The narrow unreferenced-blob window the plan documents.
+      throw new Error("Operation has no attached upload");
+    }
+
     const itemId = await ctx.db.insert("items", {
       userId,
       type: "image",
       status: "processing",
-      storageId: args.storageId,
+      storageId: op.storageId,
       aspectRatio: args.aspectRatio,
       isSticker: args.isSticker,
       capturedAt: args.capturedAt,
@@ -349,8 +666,101 @@ export const createImageItem = mutation({
     if (args.spaceId !== undefined) {
       await saveIntoSpace(ctx, userId, itemId, args.spaceId);
     }
+    await ctx.db.patch(op._id, {
+      status: "complete",
+      itemId,
+      updatedAt: Date.now(),
+    });
     await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
     return itemId;
+  },
+});
+
+/** Read-only probe of an operation's server-side state. Used by client recovery
+ * (e.g. plan 005's Tidy undo) to learn whether an operation completed. It MUST
+ * NOT create, refresh, or patch a row and must not touch updatedAt — probing on
+ * every launch through begin would create pending rows whose only exit is the
+ * 24h cleanup and refresh their updatedAt, deferring cleanup indefinitely. */
+export const getImportOperation = query({
+  args: { operationId: v.string() },
+  returns: v.union(
+    v.object({
+      status: v.union(v.literal("pending"), v.literal("complete")),
+      itemId: v.optional(v.id("items")),
+      storageId: v.optional(v.id("_storage")),
+    }),
+    v.null(),
+  ),
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    // Deliberately kind-agnostic: this probe serves every operation kind
+    // (plans 004/005 add link/note), so it must not throw a kind mismatch the
+    // way the image mutations do.
+    const op = await ctx.db
+      .query("itemOperations")
+      .withIndex("by_user_operation", (q) =>
+        q.eq("userId", userId).eq("operationId", args.operationId),
+      )
+      .unique();
+    if (op === null) {
+      return null;
+    }
+    return {
+      status: op.status,
+      itemId: op.itemId,
+      storageId: op.storageId,
+    };
+  },
+});
+
+/** Pending operations untouched for longer than this are considered abandoned
+ * and eligible for the cleanup sweep. Tests derive staleness from this. */
+export const STALE_IMPORT_CUTOFF_MS = 24 * 60 * 60 * 1000;
+
+/** Sweep a bounded page of pending image operations older than the cutoff:
+ * delete the unreferenced attached upload (the blob the process never
+ * finalized), then the ledger row. Complete rows stay as the permanent
+ * idempotency record. The index leads with kind so stale link/note rows
+ * (plans 004/005) can never fill the page and starve image cleanup. */
+/** Rows swept per transaction. A full page chains a follow-up run, so backlog
+ * drains at scheduler speed instead of one page per cron interval. */
+const CLEANUP_PAGE_SIZE = 100;
+
+export const cleanupStaleImageImports = internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx): Promise<null> => {
+    const cutoff = Date.now() - STALE_IMPORT_CUTOFF_MS;
+    const stale = await ctx.db
+      .query("itemOperations")
+      .withIndex("by_kind_status_updated", (q) =>
+        q.eq("kind", "image").eq("status", "pending").lt("updatedAt", cutoff),
+      )
+      .take(CLEANUP_PAGE_SIZE);
+    for (const op of stale) {
+      // Guarded delete: a pending row's blob is normally referenced by nothing
+      // else, but if it ever is (item or sibling operation), deleting it would
+      // destroy a live image — drop only the ledger row in that case. And a
+      // blob already gone must not throw and wedge the sweep (this mutation is
+      // transactional and re-reads the same oldest page every run).
+      if (
+        op.storageId !== undefined &&
+        (await isStorageUnreferenced(ctx, op.storageId, op._id))
+      ) {
+        await safeDeleteStorage(ctx, op.storageId);
+      }
+      await ctx.db.delete(op._id);
+    }
+    // A full page means more stale rows likely remain; sweep again immediately
+    // rather than waiting for the next cron tick.
+    if (stale.length === CLEANUP_PAGE_SIZE) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.items.cleanupStaleImageImports,
+        {},
+      );
+    }
+    return null;
   },
 });
 
@@ -443,8 +853,22 @@ export const deleteItem = mutation({
     for (const join of joins) {
       await ctx.db.delete(join._id);
     }
+    // Release the import operation(s) that produced this item so a durable
+    // operationId can be re-performed after an explicit delete (Tidy undo).
+    // Pending rows have no itemId and are excluded by the index; this only
+    // touches completed operations whose result was this item. AI processing
+    // failures do NOT release the operation — the item still exists.
+    const operations = await ctx.db
+      .query("itemOperations")
+      .withIndex("by_item", (q) => q.eq("itemId", item._id))
+      .collect();
+    for (const op of operations) {
+      await ctx.db.delete(op._id);
+    }
     if (item.storageId) {
-      await ctx.storage.delete(item.storageId);
+      // Existence-checked: if the blob is somehow already gone, the delete must
+      // still remove the item rather than throw and leave it undeletable.
+      await safeDeleteStorage(ctx, item.storageId);
     }
     await ctx.db.delete(item._id);
     return null;

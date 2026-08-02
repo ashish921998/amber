@@ -64,18 +64,31 @@ export function useTidyActions({ batch, noteDeleted }: Params) {
         // Best-effort: Android needs ACCESS_MEDIA_LOCATION, and not every
         // photo has a GPS fix — a save must never fail over its location.
         const location = await asset.getLocation().catch(() => null);
-        const [itemId] = await saveImages([
+        const [result] = await saveImages([
           {
-            uri,
-            width: photo.width ?? undefined,
-            height: photo.height ?? undefined,
-            mimeType: mimeFromUri(uri),
-            capturedAt: photo.creationTime ?? undefined,
-            latitude: location?.latitude,
-            longitude: location?.longitude,
+            image: {
+              uri,
+              width: photo.width ?? undefined,
+              height: photo.height ?? undefined,
+              mimeType: mimeFromUri(uri),
+              capturedAt: photo.creationTime ?? undefined,
+              latitude: location?.latitude,
+              longitude: location?.longitude,
+            },
           },
         ]);
-        return itemId;
+        if (result.status === 'saved') {
+          // Plan 005 owns durable Tidy save state; here we return the created
+          // itemId so undo can delete the item even mid-upload.
+          return result.itemId;
+        }
+        // A settled failure no longer rejects (the hook returns a failed
+        // result instead), so restore the prior behavior explicitly: unmark the
+        // photo so it resurfaces in a future batch, and resolve to null so undo
+        // no-ops. The result carries the stable operation id for plan 005.
+        console.warn('Tidy save failed', result.stage, result.operationId);
+        unmarkReviewed(photo.id);
+        return null;
       })().catch((error) => {
         console.warn('Tidy save failed', error);
         unmarkReviewed(photo.id);

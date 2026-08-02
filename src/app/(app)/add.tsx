@@ -1,7 +1,7 @@
 import { AnimatedText } from '@/components/animated-text';
 import { parseExifDate } from '@/lib/date';
 import { parseExifLocation } from '@/lib/exif';
-import { useSaveImages } from '@/lib/use-save-image';
+import { type ImageSaveRequest, useSaveImages } from '@/lib/use-save-image';
 import { api } from '@convex/_generated/api';
 import type { Id } from '@convex/_generated/dataModel';
 import { useMutation } from 'convex/react';
@@ -99,6 +99,47 @@ export default function AddScreen() {
     }
   };
 
+  // Runs a batch of image requests, closing on success or reporting a partial
+  // outcome. Only failed requests are retained (with their operation ids) for a
+  // retry; successful requests are never resubmitted.
+  const runImageRequests = async (requests: ImageSaveRequest[]) => {
+    if (requests.length === 0) {
+      success();
+      return;
+    }
+    setSaving(true);
+    try {
+      const results = await saveImages(requests, { spaceId: pinnedSpaceId });
+      const failed = results.filter((r) => r.status === 'failed');
+      if (failed.length === 0) {
+        success();
+        return;
+      }
+      const savedCount = results.length - failed.length;
+      Alert.alert(
+        'Could not save all images',
+        `${savedCount} of ${results.length} saved. Retry the failed images?`,
+        [
+          {
+            text: 'Retry failed',
+            onPress: () => {
+              void runImageRequests(
+                // Reuse each failed operation id on retry — never mint fresh ones.
+                failed.map((r) => ({ image: r.image, operationId: r.operationId })),
+              );
+            },
+          },
+          { text: 'Done', onPress: () => router.back() },
+        ],
+      );
+      setSaving(false);
+    } catch (err) {
+      console.error('Image upload failed:', err);
+      Alert.alert('Could not save', 'Uploading those images failed. Try again.');
+      setSaving(false);
+    }
+  };
+
   const pickImages = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
@@ -108,25 +149,18 @@ export default function AddScreen() {
       exif: true,
     });
     if (result.canceled || result.assets.length === 0) return;
-    setSaving(true);
-    try {
-      await saveImages(
-        result.assets.map((asset) => ({
+    await runImageRequests(
+      result.assets.map((asset) => ({
+        image: {
           uri: asset.uri,
           width: asset.width,
           height: asset.height,
           mimeType: asset.mimeType,
           capturedAt: parseExifDate(asset.exif),
           ...parseExifLocation(asset.exif),
-        })),
-        { spaceId: pinnedSpaceId },
-      );
-      success();
-    } catch (err) {
-      console.error('Image upload failed:', err);
-      Alert.alert('Could not save', 'Uploading those images failed. Try again.');
-      setSaving(false);
-    }
+        },
+      })),
+    );
   };
 
   const isComposer = mode === 'note' || mode === 'article';

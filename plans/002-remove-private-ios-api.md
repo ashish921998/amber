@@ -126,6 +126,7 @@ and the built app/module artifacts:
 
 ```bash
 APP=$(find /tmp/amber-private-api-check/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
+test -n "$APP"
 BINARY="$APP/amber"
 test -f "$BINARY" && test -r "$BINARY"
 
@@ -138,8 +139,11 @@ fi
 if rg \
   -e 'CAFilter' \
   -e 'variableBlur' \
-  -e 'filterWithType:' \
+  -e 'NSClassFromString' \
+  -e 'NSSelectorFromString' \
+  -e 'filterWithType' \
   -e 'inputMaskImage' \
+  -e 'base64Decode' \
   "$SCAN_OUTPUT"; then
   rg_status=0
 else
@@ -149,7 +153,10 @@ rm -f "$SCAN_OUTPUT"
 test "$strings_status" -eq 0 && test "$rg_status" -eq 1
 ```
 
-`strings` must exit 0 and `rg` must exit 1 with no output. If another dependency
+`strings` must exit 0 and `rg` must exit 1 with no output. The `test -f && test -r`
+guard and the `strings_status` check are load-bearing: without them a `strings`
+failure (missing/unreadable binary, wrong path) yields empty output, `rg` exits 1
+on the empty input, and the pipeline falsely reports a clean pass. If another dependency
 contains one of these strings, do not hide the result. This app is a prebuilt
 bare-workflow build where every pod is statically linked into the single
 `$APP/amber` binary, so "identify its binary and STOP" is not always
