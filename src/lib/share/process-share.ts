@@ -177,7 +177,17 @@ export async function processSession(
 }
 
 /** Processes a single entry and returns its settled outcome. A failure is data,
- * never a thrown promise, so it can never erase a sibling success. */
+ * never a thrown promise, so it can never erase a sibling success.
+ *
+ * Classification is RE-DERIVED from the resolved payload here, not trusted from
+ * the persisted `entry.kind`. This closes two windows: (1) a still-pending
+ * entry whose placeholder `kind: 'link'` was never overwritten by a settled
+ * save before a crash would otherwise save an image/note as a broken link; and
+ * (2) a malformed payload (blank website/text) reaching the backend for a
+ * pointless round-trip that overwrites the classifier's friendly message with
+ * a generic one. classifyPayload is the single source of truth for kind + the
+ * malformed reason; processOne honors its terminal verdicts without invoking a
+ * save. */
 async function processOne(
   entry: ShareEntry,
   resolved: ResolvedPayload[],
@@ -186,36 +196,45 @@ async function processOne(
   const payload = resolved[entry.index];
   const operationId = entry.operationId;
 
+  // Re-derive kind + malformed-ness from the resolved payload. If the payload
+  // is absent (raw/resolved divergence not caught earlier) or malformed, fail
+  // WITHOUT a backend call — no empty link/note item, no wasted round-trip.
+  if (payload === undefined) {
+    return { status: 'failed', message: 'No resolved payload for this entry' };
+  }
+  const { kind, reason } = classifyPayload(payload);
+  if (reason !== undefined) {
+    // A saveable kind with a malformed payload (blank website/text, image with
+    // no contentUri) is terminal; an unsupported type is terminal too.
+    const status: ShareEntry['status'] = kind === 'unsupported' ? 'unsupported' : 'failed';
+    return { status, message: reason };
+  }
+
   try {
-    if (entry.kind === 'link') {
-      const url = (payload?.contentType === 'website' ? payload.value : payload?.value ?? '').trim();
-      const itemId = await deps.saveLink({ url, operationId });
+    if (kind === 'link') {
+      const itemId = await deps.saveLink({
+        url: payload.value.trim(),
+        operationId,
+      });
       return { status: 'saved', itemId: String(itemId), message: undefined };
     }
-    if (entry.kind === 'note') {
-      const text = (payload?.value ?? '').trim();
-      const itemId = await deps.saveNote({ text, operationId });
+    if (kind === 'note') {
+      const itemId = await deps.saveNote({
+        text: payload.value.trim(),
+        operationId,
+      });
       return { status: 'saved', itemId: String(itemId), message: undefined };
     }
-    if (entry.kind === 'image') {
-      // A malformed image entry (no contentUri) was classified as failed by
-      // classifyEntries; reaching here means it slipped through unclassified —
-      // treat it as a failure rather than inventing a URI.
-      if (!payload?.contentUri) {
-        return { status: 'failed', message: 'Image could not be resolved' };
-      }
-      const image: LocalImage = {
-        uri: payload.contentUri,
-        mimeType: payload.contentMimeType ?? undefined,
-      };
-      const result = await deps.saveImage({ image, operationId });
-      if (result.status === 'saved') {
-        return { status: 'saved', itemId: String(result.itemId), message: undefined };
-      }
-      return { status: 'failed', message: result.message };
+    // kind === 'image' (classifyPayload guarantees contentUri when no reason).
+    const image: LocalImage = {
+      uri: payload.contentUri!,
+      mimeType: payload.contentMimeType ?? undefined,
+    };
+    const result = await deps.saveImage({ image, operationId });
+    if (result.status === 'saved') {
+      return { status: 'saved', itemId: String(result.itemId), message: undefined };
     }
-    // kind === 'unsupported' — never reached (filtered above), but defensive.
-    return { status: 'unsupported', message: entry.message ?? 'Unsupported content' };
+    return { status: 'failed', message: result.message };
   } catch (error) {
     return {
       status: 'failed',

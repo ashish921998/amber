@@ -12,7 +12,7 @@ when done.
 | 001 | Establish one reliable verification command | P1 | M | — | DONE |
 | 002 | Remove the private iOS blur API | P1 | M | 001 | IN PROGRESS — code/scan/build done; visual matrix (4 headers × scroll, touch, rotation, light/dark, physical device) not yet verified |
 | 003 | Make image imports idempotent and retry-safe | P1 | L | 001 | DONE |
-| 004 | Make incoming shares recoverable | P1 | L | 003 | DONE |
+| 004 | Make incoming shares recoverable | P1 | L | 003 | IN PROGRESS — automated tests pass (104); Step 5 manual iOS/Android device matrix (retry, remount, process-termination) still pending |
 | 005 | Make Tidy saves durable | P1 | L | 003 | TODO |
 | 006 | Preserve Tidy deletions when confirmation fails | P1 | M | 005 | TODO |
 | 007 | Enforce a safe backend URL-fetch policy | P1 | L | 001 | TODO |

@@ -67,12 +67,28 @@ export type ShareEntry = {
 export type ShareSession = {
   version: number;
   fingerprint: string;
+  /** The authenticated user (Clerk subject) this session belongs to. A record
+   * left by a prior account must never be matched by a new user, even if the
+   * share content is identical — otherwise switching accounts can silently drop
+   * the new user's share by matching a stale completed session. loadSession and
+   * reconcileSession treat a userId mismatch as "no session" (start fresh). */
+  userId: string;
   sessionId: string;
   phase: 'active' | 'complete';
   entries: ShareEntry[];
 };
 
 export const SESSION_SCHEMA_VERSION = 1;
+
+/** The status/kind enums, centralized so loadSession can validate every entry
+ * against a closed set rather than trusting arbitrary persisted strings. */
+const ENTRY_STATUSES = new Set<ShareEntryStatus>([
+  'pending',
+  'saved',
+  'failed',
+  'unsupported',
+]);
+const ENTRY_KINDS = new Set<ShareEntryKind>(['link', 'note', 'image', 'unsupported']);
 
 const SESSION_KEY = 'incoming-share-session';
 
@@ -101,9 +117,11 @@ export function fingerprint(rawPayloads: RawSharePayload[]): string {
 // ---------------------------------------------------------------------------
 
 /** Reads the persisted session, or null if absent or incompatible with the
- * current schema version. An incompatible (future/older) shape is dropped: the
- * caller treats the next reconciliation as a fresh session rather than guessing
- * at an unknown layout. */
+ * current schema version. An incompatible (future/older) shape, a corrupt
+ * record, OR any entry that fails structural validation is dropped: the caller
+ * treats the next reconciliation as a fresh session rather than guessing at an
+ * unknown layout. This is the only place a stale/corrupt record is sanitized,
+ * so the rest of the module can trust the shape unconditionally. */
 export function loadSession(store: SessionStoreAdapter): ShareSession | null {
   const raw = store.getString(SESSION_KEY);
   if (raw === undefined) return null;
@@ -113,10 +131,14 @@ export function loadSession(store: SessionStoreAdapter): ShareSession | null {
       typeof parsed.version !== 'number' ||
       parsed.version !== SESSION_SCHEMA_VERSION ||
       typeof parsed.fingerprint !== 'string' ||
+      typeof parsed.userId !== 'string' ||
+      parsed.userId.length === 0 ||
       typeof parsed.sessionId !== 'string' ||
       parsed.sessionId.length === 0 ||
       (parsed.phase !== 'active' && parsed.phase !== 'complete') ||
-      !Array.isArray(parsed.entries)
+      !Array.isArray(parsed.entries) ||
+      parsed.entries.length === 0 ||
+      !parsed.entries.every(isValidEntry)
     ) {
       // Unknown/incompatible shape — drop it so a fresh session starts clean.
       store.remove(SESSION_KEY);
@@ -129,16 +151,29 @@ export function loadSession(store: SessionStoreAdapter): ShareSession | null {
   }
 }
 
+/** Structural validator for one persisted entry. Requires an integer index, a
+ * non-empty operationId, and a kind/status from the closed sets. A single bad
+ * entry invalidates the whole record (we cannot tell which entries are trusted
+ * if one is corrupt), so the caller drops it and starts a fresh session. */
+function isValidEntry(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const e = value as Record<string, unknown>;
+  return (
+    typeof e.index === 'number' &&
+    Number.isInteger(e.index) &&
+    e.index >= 0 &&
+    typeof e.operationId === 'string' &&
+    e.operationId.length > 0 &&
+    typeof e.kind === 'string' &&
+    ENTRY_KINDS.has(e.kind as ShareEntryKind) &&
+    typeof e.status === 'string' &&
+    ENTRY_STATUSES.has(e.status as ShareEntryStatus)
+  );
+}
+
 /** Writes (or replaces) the persisted session. */
 function saveSession(store: SessionStoreAdapter, session: ShareSession): void {
   store.set(SESSION_KEY, JSON.stringify(session));
-}
-
-/** Removes the persisted session entirely. Called once a completed session has
- * been reconciled against (used to clear native payloads) so a later identical
- * re-share starts fresh instead of matching a stale completed record. */
-export function deleteSession(store: SessionStoreAdapter): void {
-  store.remove(SESSION_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,12 +202,19 @@ export type ReconcileResult =
  * whether this batch is brand-new, an active session to resume, a completed
  * session whose native payloads must be cleared, or empty.
  *
- * Completed-state is single-use: a fingerprint match alone is NOT durable
- * identity. Once a completed session has been reconciled (used to clear), the
- * record is deleted here so a deliberate later re-share of identical content
- * starts a fresh session rather than being silently dropped. */
+ * Sessions are scoped to the authenticated `userId`: a record left by a
+ * different user (e.g. an account switch on a shared device) is treated as no
+ * session and a fresh one starts, so a prior account's completed session can
+ * never silently drop the new user's identical share.
+ *
+ * Completed-state is single-use: a fingerprint (and user) match alone is NOT a
+ * durable "drop this share" signal. The caller clears native payloads and
+ * deletes the record only after a non-throwing clear — reconcileSession itself
+ * does NOT delete a completed record, so a throwing clear stays retryable on
+ * remount. */
 export function reconcileSession(
   store: SessionStoreAdapter,
+  userId: string,
   rawPayloads: RawSharePayload[],
   generateSessionId: () => string,
 ): ReconcileResult {
@@ -186,15 +228,17 @@ export function reconcileSession(
   const currentFp = fingerprint(rawPayloads);
   const existing = loadSession(store);
 
-  if (existing === null) {
-    return { kind: 'new', session: newSession(store, currentFp, rawPayloads, generateSessionId) };
+  // A session from a different user, or no session at all: start fresh. The
+  // mismatched record is replaced by newSession below.
+  if (existing === null || existing.userId !== userId) {
+    return { kind: 'new', session: newSession(store, userId, currentFp, rawPayloads, generateSessionId) };
   }
 
   if (existing.fingerprint !== currentFp) {
     // Different batch: a new share superseded the previous one. Start fresh,
     // replacing the stale record. (The previous session's native payloads are
     // gone — a new share cannot arrive while old ones linger natively.)
-    return { kind: 'new', session: newSession(store, currentFp, rawPayloads, generateSessionId) };
+    return { kind: 'new', session: newSession(store, userId, currentFp, rawPayloads, generateSessionId) };
   }
 
   // Same batch as the persisted session.
@@ -218,6 +262,7 @@ export function reconcileSession(
  * resolves and saves them. */
 function newSession(
   store: SessionStoreAdapter,
+  userId: string,
   fp: string,
   rawPayloads: RawSharePayload[],
   generateSessionId: () => string,
@@ -226,6 +271,7 @@ function newSession(
   const session: ShareSession = {
     version: SESSION_SCHEMA_VERSION,
     fingerprint: fp,
+    userId,
     sessionId,
     phase: 'active',
     entries: rawPayloads.map((_, index) => ({
@@ -244,14 +290,19 @@ function newSession(
 // ---------------------------------------------------------------------------
 
 /** Updates one entry by index and persists the result. No-op (and no write) if
- * the session no longer exists — e.g. it was cleared between renders. */
+ * the session no longer exists OR if `sessionId` is provided and does not match
+ * the current persisted session — the latter guards an in-flight save run from
+ * mutating a NEWER session that replaced its record mid-flight (a new share
+ * arriving while the old run is still saving). */
 export function updateEntry(
   store: SessionStoreAdapter,
   index: number,
   patch: Partial<ShareEntry>,
+  sessionId?: string,
 ): void {
   const session = loadSession(store);
   if (session === null) return;
+  if (sessionId !== undefined && session.sessionId !== sessionId) return;
   const entry = session.entries.find((e) => e.index === index);
   if (entry === undefined) return;
   Object.assign(entry, patch);
@@ -260,13 +311,35 @@ export function updateEntry(
 
 /** Marks the session complete and persists it. MUST be called BEFORE the native
  * clear so the after-clear-but-before-local-delete window reconciles correctly
- * (a matching completed session clears native payloads and deletes itself). */
-export function markComplete(store: SessionStoreAdapter): void {
+ * (a matching completed session clears native payloads and deletes itself).
+ *
+ * `sessionId` scopes the completion to the originating session: an in-flight
+ * run that finished after a newer session replaced its record must NOT mark the
+ * newer session complete (which would clear the new share without saving it). */
+export function markComplete(
+  store: SessionStoreAdapter,
+  sessionId?: string,
+): void {
   const session = loadSession(store);
   if (session === null) return;
+  if (sessionId !== undefined && session.sessionId !== sessionId) return;
   if (session.phase === 'complete') return; // idempotent
   session.phase = 'complete';
   saveSession(store, session);
+}
+
+/** Deletes the persisted session, but only if its id matches `sessionId` when
+ * provided. Scoped so an in-flight run completing after a newer session arrived
+ * cannot delete the newer session's record. */
+export function deleteSession(
+  store: SessionStoreAdapter,
+  sessionId?: string,
+): void {
+  if (sessionId !== undefined) {
+    const session = loadSession(store);
+    if (session !== null && session.sessionId !== sessionId) return;
+  }
+  store.remove(SESSION_KEY);
 }
 
 /** True if every entry in the session is in a terminal (saved/failed/

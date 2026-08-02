@@ -41,6 +41,7 @@ function makeSession(entryCount: number, sessionId = "sess-1"): ShareSession {
   return {
     version: 1,
     fingerprint: "fp",
+    userId: "user-a",
     sessionId,
     phase: "active",
     entries,
@@ -313,6 +314,82 @@ describe("processSession", () => {
     expect(second.entries[0].itemId).toBe("items:survived");
     // Same operation id across both passes (stable retry key).
     expect(saveLink.mock.calls[0][0].operationId).toBe(saveLink.mock.calls[1][0].operationId);
+  });
+
+  it("does not re-attempt a malformed link/note and never calls the backend", async () => {
+    // processOne must re-validate the payload and fail fast WITHOUT a save call,
+    // rather than sending an empty url/text to the backend (pointless round-trip
+    // that also overwrites the classifier's friendly message).
+    const session = makeSession(2);
+    const resolved = [
+      urlPayload("   "), // blank website
+      textPayload("   "), // blank text
+    ];
+    const classified = classifyEntries(session, resolved);
+    expect(classified.map((e) => e.status)).toEqual(["failed", "failed"]);
+    const saveLink = vi.fn(async () => "should-not-be-called" as Id<"items">);
+    const saveNote = vi.fn(async () => "should-not-be-called" as Id<"items">);
+    const deps = makeDeps({ saveLink, saveNote });
+
+    const result = await processSession({ ...session, entries: classified }, resolved, deps);
+    expect(result.entries.map((e) => e.status)).toEqual(["failed", "failed"]);
+    // No backend call was made for either malformed entry.
+    expect(saveLink).not.toHaveBeenCalled();
+    expect(saveNote).not.toHaveBeenCalled();
+    // The classifier's friendly messages are preserved, not overwritten by a
+    // backend "Invalid URL" / "Note text is empty" error.
+    expect(result.entries[0].message).toBe("Shared link was not a valid URL");
+    expect(result.entries[1].message).toBe("Shared text was empty");
+  });
+
+  it("saves an image correctly on resume even if its persisted kind placeholder is link", async () => {
+    // Regression for the crash window: an entry classified image in-memory but
+    // whose placeholder kind:'link' was persisted (the entry never settled
+    // before the crash). On resume, processOne must re-derive 'image' from the
+    // resolved payload and call saveImage — NOT saveLink.
+    const session = makeSession(1);
+    const resolved = [imagePayload("file://img.jpg")];
+    // Simulate the persisted state: kind='link' placeholder, status='pending'.
+    const persistedPending: ShareEntry[] = [
+      { ...session.entries[0], kind: "link", status: "pending" },
+    ];
+    const saveImage = vi.fn(async ({ operationId }) => ({
+      status: "saved" as const,
+      operationId,
+      image: { uri: "file://img.jpg" },
+      itemId: "items:image-resume" as Id<"items">,
+    }));
+    const saveLink = vi.fn(async () => "should-not-be-called" as Id<"items">);
+    const deps = makeDeps({ saveImage, saveLink });
+
+    const result = await processSession(
+      { ...session, entries: persistedPending },
+      resolved,
+      deps,
+    );
+    expect(result.entries[0].status).toBe("saved");
+    expect(result.entries[0].itemId).toBe("items:image-resume");
+    // Re-derived kind was image, so saveImage ran and saveLink did NOT.
+    expect(saveImage).toHaveBeenCalledTimes(1);
+    expect(saveLink).not.toHaveBeenCalled();
+  });
+
+  it("fails an image with no contentUri without a backend call", async () => {
+    const session = makeSession(1);
+    const resolved = [imagePayload(null)];
+    const classified = classifyEntries(session, resolved);
+    expect(classified[0].status).toBe("failed");
+    const saveImage = vi.fn(async () => ({
+      status: "saved" as const,
+      operationId: "x",
+      image: { uri: "x" },
+      itemId: "should-not-be-called" as Id<"items">,
+    }));
+    const deps = makeDeps({ saveImage });
+    const result = await processSession({ ...session, entries: classified }, resolved, deps);
+    expect(result.entries[0].status).toBe("failed");
+    expect(result.entries[0].message).toBe("Image could not be resolved");
+    expect(saveImage).not.toHaveBeenCalled();
   });
 
   it("sanitizes URLs and ids out of a thrown failure message", async () => {
