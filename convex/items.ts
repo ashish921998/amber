@@ -292,18 +292,212 @@ async function saveIntoSpace(
   });
 }
 
-export const generateUploadUrl = mutation({
-  args: {},
-  returns: v.string(),
-  handler: async (ctx) => {
-    await requireUserId(ctx);
-    return await ctx.storage.generateUploadUrl();
+// ---------------------------------------------------------------------------
+// Image import operation ledger
+// ---------------------------------------------------------------------------
+//
+// Idempotent image save with a stable per-image operation ID so a retry never
+// duplicates a success and never resubmits one. The client flow is:
+//
+//   begin  -> { uploadUrl } (or { itemId } if already finalized)
+//   upload bytes to the upload URL out-of-band (outside the Convex txn)
+//   attach -> records the storageId on the pending operation
+//   finalize -> validates metadata and atomically inserts the item + completes
+//
+// Correctness goal is idempotency + compensation, NOT upload+DB atomicity: a
+// process can crash after the upload succeeds but before `attach` records the
+// storageId, leaving an unreferenced blob. That narrow gap is swept by the
+// stale-pending cleanup cron; it is documented, not eliminated.
+
+/** Operation IDs are opaque client UUIDs (optionally prefixed for logs). This
+ * bounds length so a stray empty/huge string can't pollute the index. */
+const OPERATION_ID_MIN = 8;
+const OPERATION_ID_MAX = 200;
+
+function requireOperationId(operationId: string): void {
+  if (
+    typeof operationId !== "string" ||
+    operationId.length < OPERATION_ID_MIN ||
+    operationId.length > OPERATION_ID_MAX
+  ) {
+    throw new Error("Invalid operationId");
+  }
+}
+
+/** Loads the caller's image operation for `operationId`, or null. The (userId,
+ * operationId) pair is the logical unique key — never look one up without both.
+ * Callers that expect a specific `kind` must pass it so a reused operation ID
+ * can't silently switch from image to link/note. */
+async function loadImageOperation(
+  ctx: QueryCtx | MutationCtx,
+  userId: string,
+  operationId: string,
+  kind: "image" | "link" | "note" = "image",
+): Promise<Doc<"itemOperations"> | null> {
+  const op = await ctx.db
+    .query("itemOperations")
+    .withIndex("by_user_operation", (q) =>
+      q.eq("userId", userId).eq("operationId", operationId),
+    )
+    .unique();
+  if (op === null) {
+    return null;
+  }
+  if (op.kind !== kind) {
+    throw new Error("Operation kind mismatch");
+  }
+  return op;
+}
+
+/** Discriminated return for beginImageImport. A named type (rather than inline
+ * object literals) keeps `kind` a literal so the `returns` validator matches. */
+type BeginImageImportResult =
+  | { kind: "upload"; uploadUrl: string }
+  | { kind: "complete"; itemId: Id<"items"> };
+
+/** Validates image metadata exactly as the legacy createImageItem did, so
+ * finalize rejects bad input without marking the operation complete. */
+function validateImageMetadata(args: {
+  aspectRatio?: number;
+  latitude?: number;
+  longitude?: number;
+}): void {
+  if (
+    args.aspectRatio !== undefined &&
+    (!Number.isFinite(args.aspectRatio) || args.aspectRatio <= 0)
+  ) {
+    throw new Error("Invalid aspectRatio");
+  }
+  // Location is all-or-nothing: a lone latitude can't be plotted.
+  const hasLocation =
+    args.latitude !== undefined && args.longitude !== undefined;
+  if (
+    (args.latitude !== undefined || args.longitude !== undefined) &&
+    (!hasLocation ||
+      !Number.isFinite(args.latitude) ||
+      Math.abs(args.latitude!) > 90 ||
+      !Number.isFinite(args.longitude) ||
+      Math.abs(args.longitude!) > 180)
+  ) {
+    throw new Error("Invalid location");
+  }
+}
+
+export const beginImageImport = mutation({
+  args: { operationId: v.string() },
+  returns: v.union(
+    v.object({ kind: v.literal("upload"), uploadUrl: v.string() }),
+    v.object({ kind: v.literal("complete"), itemId: v.id("items") }),
+  ),
+  handler: async (ctx, args): Promise<BeginImageImportResult> => {
+    const userId = await requireUserId(ctx);
+    requireOperationId(args.operationId);
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const now = Date.now();
+
+    if (op === null) {
+      await ctx.db.insert("itemOperations", {
+        userId,
+        operationId: args.operationId,
+        kind: "image",
+        status: "pending",
+        updatedAt: now,
+      });
+      return {
+        kind: "upload",
+        uploadUrl: await ctx.storage.generateUploadUrl(),
+      };
+    }
+
+    if (op.status === "complete") {
+      // A complete operation whose item was explicitly deleted is recyclable:
+      // reset to pending so the durable operationId performs a fresh save.
+      if (op.itemId !== undefined) {
+        const item = await ctx.db.get(op.itemId);
+        if (item === null) {
+          await ctx.db.patch(op._id, {
+            status: "pending",
+            itemId: undefined,
+            storageId: undefined,
+            updatedAt: now,
+          });
+          return {
+            kind: "upload",
+            uploadUrl: await ctx.storage.generateUploadUrl(),
+          };
+        }
+        return { kind: "complete", itemId: op.itemId };
+      }
+      // Defensive: a complete row with no itemId is inconsistent; recycle it.
+      await ctx.db.patch(op._id, { status: "pending", updatedAt: now });
+      return {
+        kind: "upload",
+        uploadUrl: await ctx.storage.generateUploadUrl(),
+      };
+    }
+
+    // Pending: refresh updatedAt (a begin is active interest) and hand back a
+    // fresh URL. A retry that re-uploads is correct-by-design — attach keeps
+    // the first storageId and discards the redundant blob.
+    await ctx.db.patch(op._id, { updatedAt: now });
+    return {
+      kind: "upload",
+      uploadUrl: await ctx.storage.generateUploadUrl(),
+    };
   },
 });
 
-export const createImageItem = mutation({
+export const attachImageUpload = mutation({
   args: {
+    operationId: v.string(),
     storageId: v.id("_storage"),
+  },
+  returns: v.object({ storageId: v.id("_storage") }),
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    requireOperationId(args.operationId);
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+    const now = Date.now();
+
+    if (op === null) {
+      // No begin happened (or the row was swept). Create a pending row so the
+      // caller's finalize can still proceed, then attach.
+      await ctx.db.insert("itemOperations", {
+        userId,
+        operationId: args.operationId,
+        kind: "image",
+        status: "pending",
+        storageId: args.storageId,
+        updatedAt: now,
+      });
+      return { storageId: args.storageId };
+    }
+
+    if (op.status === "complete") {
+      // Already finalized: keep the canonical id and discard any redundant
+      // upload from a racing retry.
+      if (op.storageId !== undefined && op.storageId !== args.storageId) {
+        await ctx.storage.delete(args.storageId);
+      }
+      return { storageId: (op.storageId ?? args.storageId) };
+    }
+
+    // First attachment wins. A racing retry that supplies a different storageId
+    // has re-uploaded redundantly — delete the redundant blob and return the
+    // canonical id rather than replacing it.
+    if (op.storageId !== undefined && op.storageId !== args.storageId) {
+      await ctx.storage.delete(args.storageId);
+      await ctx.db.patch(op._id, { updatedAt: now });
+      return { storageId: op.storageId };
+    }
+    await ctx.db.patch(op._id, { storageId: args.storageId, updatedAt: now });
+    return { storageId: args.storageId };
+  },
+});
+
+export const finalizeImageImport = mutation({
+  args: {
+    operationId: v.string(),
     aspectRatio: v.optional(v.number()),
     isSticker: v.optional(v.boolean()),
     capturedAt: v.optional(v.number()),
@@ -314,30 +508,36 @@ export const createImageItem = mutation({
   returns: v.id("items"),
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
-    if (
-      args.aspectRatio !== undefined &&
-      (!Number.isFinite(args.aspectRatio) || args.aspectRatio <= 0)
-    ) {
-      throw new Error("Invalid aspectRatio");
+    requireOperationId(args.operationId);
+    // Validate BEFORE touching the ledger: invalid metadata must not mark the
+    // operation complete, so the caller can retry with corrected input.
+    validateImageMetadata(args);
+
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+
+    // Already complete — return the original live item id. (A complete row
+    // pointing at a deleted item should have been recycled by begin; if we
+    // reach here, treat it as complete with the recorded id.)
+    if (op !== null && op.status === "complete" && op.itemId !== undefined) {
+      return op.itemId;
     }
-    // Location is all-or-nothing: a lone latitude can't be plotted.
-    const hasLocation =
-      args.latitude !== undefined && args.longitude !== undefined;
-    if (
-      (args.latitude !== undefined || args.longitude !== undefined) &&
-      (!hasLocation ||
-        !Number.isFinite(args.latitude) ||
-        Math.abs(args.latitude!) > 90 ||
-        !Number.isFinite(args.longitude) ||
-        Math.abs(args.longitude!) > 180)
-    ) {
-      throw new Error("Invalid location");
+
+    if (op === null) {
+      // The caller skipped begin (or the row was swept). We have no storageId
+      // to attach, so this is an invalid import attempt.
+      throw new Error("Operation has no attached upload");
     }
+    if (op.storageId === undefined) {
+      // begin succeeded but attach never ran (process died between upload and
+      // attach). The narrow unreferenced-blob window the plan documents.
+      throw new Error("Operation has no attached upload");
+    }
+
     const itemId = await ctx.db.insert("items", {
       userId,
       type: "image",
       status: "processing",
-      storageId: args.storageId,
+      storageId: op.storageId,
       aspectRatio: args.aspectRatio,
       isSticker: args.isSticker,
       capturedAt: args.capturedAt,
@@ -349,8 +549,70 @@ export const createImageItem = mutation({
     if (args.spaceId !== undefined) {
       await saveIntoSpace(ctx, userId, itemId, args.spaceId);
     }
+    await ctx.db.patch(op._id, {
+      status: "complete",
+      itemId,
+      updatedAt: Date.now(),
+    });
     await ctx.scheduler.runAfter(0, internal.ai.processItem, { itemId });
     return itemId;
+  },
+});
+
+/** Read-only probe of an operation's server-side state. Used by client recovery
+ * (e.g. plan 005's Tidy undo) to learn whether an operation completed. It MUST
+ * NOT create, refresh, or patch a row and must not touch updatedAt — probing on
+ * every launch through begin would create pending rows whose only exit is the
+ * 24h cleanup and refresh their updatedAt, deferring cleanup indefinitely. */
+export const getImportOperation = query({
+  args: { operationId: v.string() },
+  returns: v.union(
+    v.object({
+      status: v.union(v.literal("pending"), v.literal("complete")),
+      itemId: v.optional(v.id("items")),
+      storageId: v.optional(v.id("_storage")),
+    }),
+    v.null(),
+  ),
+  handler: async (ctx, args) => {
+    const userId = await requireUserId(ctx);
+    const op = await loadImageOperation(ctx, userId, args.operationId);
+    if (op === null) {
+      return null;
+    }
+    return {
+      status: op.status,
+      itemId: op.itemId,
+      storageId: op.storageId,
+    };
+  },
+});
+
+/** Sweep a bounded page of pending image operations older than 24h: delete the
+ * unreferenced attached upload (the blob the process never finalized), then the
+ * ledger row. Complete rows stay as the permanent idempotency record. */
+export const cleanupStaleImageImports = internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const stale = await ctx.db
+      .query("itemOperations")
+      .withIndex("by_status_updated", (q) =>
+        q.eq("status", "pending").lt("updatedAt", cutoff),
+      )
+      .take(100);
+    for (const op of stale) {
+      if (op.kind !== "image") {
+        // Plan 004/005 own link/note cleanup; leave non-image rows to them.
+        continue;
+      }
+      if (op.storageId !== undefined) {
+        await ctx.storage.delete(op.storageId);
+      }
+      await ctx.db.delete(op._id);
+    }
+    return null;
   },
 });
 
@@ -442,6 +704,18 @@ export const deleteItem = mutation({
       .collect();
     for (const join of joins) {
       await ctx.db.delete(join._id);
+    }
+    // Release the import operation(s) that produced this item so a durable
+    // operationId can be re-performed after an explicit delete (Tidy undo).
+    // Pending rows have no itemId and are excluded by the index; this only
+    // touches completed operations whose result was this item. AI processing
+    // failures do NOT release the operation — the item still exists.
+    const operations = await ctx.db
+      .query("itemOperations")
+      .withIndex("by_item", (q) => q.eq("itemId", item._id))
+      .take(10);
+    for (const op of operations) {
+      await ctx.db.delete(op._id);
     }
     if (item.storageId) {
       await ctx.storage.delete(item.storageId);

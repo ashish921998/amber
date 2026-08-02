@@ -1,0 +1,324 @@
+// @vitest-environment edge-runtime
+/// <reference types="vite/client" />
+import { describe, expect, it } from "vitest";
+
+import { convexTest, type TestConvexForDataModel } from "convex-test";
+
+import { api, internal } from "./_generated/api";
+import type { DataModel, Id } from "./_generated/dataModel";
+import schema from "./schema";
+
+// The accessor returned by withIdentity (no further withIdentity/registerComponent).
+// Used as the shared param type for helpers that drive either a base or
+// identity-scoped test backend.
+type TestCtx = TestConvexForDataModel<DataModel>;
+
+// The module map lets convex-test discover and load function files.
+const modules = import.meta.glob("./**/*.ts");
+
+// A representative operation id (UUID-shaped, within the 8–200 char bound).
+const OP_ID = "image:11111111-1111-4111-8111-111111111111";
+const OP_ID_2 = "image:22222222-2222-4222-8222-222222222222";
+
+// Each test gets its own authenticated user via withIdentity. subject is the
+// value requireUserId returns, so different subjects model different users.
+function as(userId: string): TestCtx {
+  return convexTest(schema, modules).withIdentity({ subject: userId });
+}
+
+/** Uploads a blob to mock storage and returns its id, the way a real client
+ * would after POSTing to the upload URL begin returns. */
+async function storeBlob(t: TestCtx): Promise<Id<"_storage">> {
+  return await t.run(async (ctx) => {
+    return await ctx.storage.store(new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])]));
+  });
+}
+
+describe("image import lifecycle", () => {
+  it("finalizes a pending operation into one item and schedules processing", async () => {
+    const t = as("user-a");
+    const begin = await t.mutation(api.items.beginImageImport, {
+      operationId: OP_ID,
+    });
+    expect(begin.kind).toBe("upload");
+
+    const storageId = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId,
+    });
+    const itemId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+    expect(typeof itemId).toBe("string");
+
+    // The scheduled AI job is queued; verify the item landed as processing.
+    const op = await t.query(api.items.getImportOperation, { operationId: OP_ID });
+    expect(op?.status).toBe("complete");
+    expect(op?.itemId).toBe(itemId);
+    expect(op?.storageId).toBe(storageId);
+
+    const item = await t.run(async (ctx) => await ctx.db.get(itemId));
+    expect(item?.type).toBe("image");
+    expect(item?.status).toBe("processing");
+    expect(item?.storageId).toBe(storageId);
+  });
+
+  it("returns the same item when begin/finalize repeat the same operation", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const storageId = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId,
+    });
+    const firstId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+
+    // A retry that begins the same completed operation should get the item back
+    // without needing to re-upload.
+    const began = await t.mutation(api.items.beginImageImport, {
+      operationId: OP_ID,
+    });
+    expect(began).toEqual({ kind: "complete", itemId: firstId });
+
+    // Finalizing again returns the same id, never a second item.
+    const secondId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+    expect(secondId).toBe(firstId);
+
+    // Exactly one image item exists for this user.
+    const items = await t.run(async (ctx) => {
+      return await ctx.db
+        .query("items")
+        .withIndex("by_user", (q) => q.eq("userId", "user-a"))
+        .collect();
+    });
+    expect(items.filter((i) => i.type === "image")).toHaveLength(1);
+  });
+
+  it("keeps the same operation id independent across users", async () => {
+    // Both users must operate against ONE shared backend so the (userId,
+    // operationId) pair — not database isolation — is what distinguishes them.
+    const backend = convexTest(schema, modules);
+    const ta = backend.withIdentity({ subject: "user-a" });
+    const tb = backend.withIdentity({ subject: "user-b" });
+
+    // user-a finalizes the operation.
+    await ta.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const sa = await storeBlob(ta);
+    await ta.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: sa,
+    });
+    const aId = await ta.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+
+    // user-b using the same operation id is a separate operation and a separate
+    // item — the (userId, operationId) pair is the unique key.
+    await tb.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const sb = await storeBlob(tb);
+    await tb.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: sb,
+    });
+    const bId = await tb.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+    expect(bId).not.toBe(aId);
+
+    const opA = await ta.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    const opB = await tb.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(opA?.itemId).toBe(aId);
+    expect(opB?.itemId).toBe(bId);
+  });
+
+  it("rejects reusing an operation id with a different kind", async () => {
+    // Seed a completed image operation directly.
+    const t = as("user-a");
+    await t.run(async (ctx) => {
+      await ctx.db.insert("itemOperations", {
+        userId: "user-a",
+        operationId: OP_ID,
+        kind: "image",
+        status: "complete",
+        updatedAt: Date.now(),
+      });
+    });
+
+    // beginImageImport loads with kind "image" by default; a future link/note
+    // flow (plan 004) would load with a different kind and must be rejected.
+    // Simulate that by checking the helper's contract through the image path:
+    // a second image operation with the same id is fine, but we assert a kind
+    // mismatch throws when an op exists as a different kind.
+    await t.run(async (ctx) => {
+      const op = await ctx.db
+        .query("itemOperations")
+        .withIndex("by_user_operation", (q) =>
+          q.eq("userId", "user-a").eq("operationId", OP_ID),
+        )
+        .unique();
+      if (op === null) throw new Error("seed op missing");
+      await ctx.db.patch(op._id, { kind: "link" });
+    });
+    await expect(
+      t.mutation(api.items.beginImageImport, { operationId: OP_ID }),
+    ).rejects.toThrow(/kind mismatch/i);
+  });
+
+  it("keeps one canonical storage id and discards a redundant attachment", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const first = await storeBlob(t);
+    const second = await storeBlob(t);
+
+    const r1 = await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: first,
+    });
+    expect(r1.storageId).toBe(first);
+
+    // A racing retry attaches a different storage id; first attachment wins and
+    // the redundant blob is deleted.
+    const r2 = await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: second,
+    });
+    expect(r2.storageId).toBe(first);
+
+    // The redundant blob is gone; the canonical one survives.
+    const secondGone = await t.run(async (ctx) =>
+      ctx.db.system.get("_storage", second),
+    );
+    expect(secondGone).toBeNull();
+    const firstAlive = await t.run(async (ctx) =>
+      ctx.db.system.get("_storage", first),
+    );
+    expect(firstAlive).not.toBeNull();
+
+    // Finalize uses the canonical storage id.
+    const itemId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+    const item = await t.run(async (ctx) => await ctx.db.get(itemId));
+    expect(item?.storageId).toBe(first);
+  });
+
+  it("does not mark the operation complete on invalid metadata", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const storageId = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId,
+    });
+
+    // An impossible aspect ratio must throw and must NOT complete the operation.
+    await expect(
+      t.mutation(api.items.finalizeImageImport, {
+        operationId: OP_ID,
+        aspectRatio: -1,
+      }),
+    ).rejects.toThrow(/aspectRatio/i);
+
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(op?.status).toBe("pending");
+
+    // A corrected retry can still succeed.
+    const itemId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+      aspectRatio: 1.5,
+    });
+    const opAfter = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(opAfter?.status).toBe("complete");
+    expect(opAfter?.itemId).toBe(itemId);
+  });
+
+  it("releases the operation when its item is explicitly deleted", async () => {
+    const t = as("user-a");
+    await t.mutation(api.items.beginImageImport, { operationId: OP_ID });
+    const storageId = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId,
+    });
+    const itemId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+
+    await t.mutation(api.items.deleteItem, { id: itemId });
+
+    // The operation row is gone, so the durable id can be re-performed.
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(op).toBeNull();
+
+    // begin now treats it as a fresh operation (pending + new upload), not the
+    // deleted item.
+    const began = await t.mutation(api.items.beginImageImport, {
+      operationId: OP_ID,
+    });
+    expect(began.kind).toBe("upload");
+  });
+
+  it("deletes only eligible unreferenced stale pending uploads", async () => {
+    const t = as("user-a");
+
+    // A stale pending operation with an attached upload (process died between
+    // upload and finalize). Its storage should be swept.
+    await t.run(async (ctx) => {
+      const storageId = await ctx.storage.store(new Blob([new Uint8Array([1, 2, 3])]));
+      await ctx.db.insert("itemOperations", {
+        userId: "user-a",
+        operationId: OP_ID,
+        kind: "image",
+        status: "pending",
+        storageId,
+        updatedAt: Date.now() - 25 * 60 * 60 * 1000, // 25h old
+      });
+    });
+
+    // A fresh pending operation (well within the 24h window) — must survive.
+    const freshStorageId = await storeBlob(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("itemOperations", {
+        userId: "user-a",
+        operationId: OP_ID_2,
+        kind: "image",
+        status: "pending",
+        storageId: freshStorageId,
+        updatedAt: Date.now(),
+      });
+    });
+
+    await t.mutation(internal.items.cleanupStaleImageImports, {});
+
+    // Stale op + its blob are gone.
+    const staleOp = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(staleOp).toBeNull();
+
+    // Fresh op + its blob survive.
+    const freshOp = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID_2,
+    });
+    expect(freshOp?.status).toBe("pending");
+    const freshBlob = await t.run(async (ctx) =>
+      ctx.db.system.get("_storage", freshStorageId),
+    );
+    expect(freshBlob).not.toBeNull();
+  });
+});

@@ -124,4 +124,36 @@ export default defineSchema({
     .index("by_space", ["spaceId"])
     .index("by_item", ["itemId"])
     .index("by_user", ["userId"]),
+
+  // Generic per-import idempotency ledger. One row per (userId, operationId),
+  // where operationId is an opaque client-generated UUID. Plans 004/005 reuse
+  // this table for link/note share and Tidy durability, so `kind` is closed
+  // and kind-checked on every lookup; an operation ID reused with a different
+  // kind is rejected rather than silently repurposed. The lifecycle is:
+  //
+  //   begin (pending) -> upload bytes -> attach storageId -> finalize (complete)
+  //
+  // `complete` rows are the permanent idempotency record — a retry reads the
+  // same itemId back. `pending` rows older than 24h whose attached upload was
+  // never finalized are swept by a bounded cleanup cron; their storage object
+  // is deleted first. A completed row whose item was explicitly deleted is
+  // recycled back to pending by beginImageImport, so a reissued durable
+  // operationId performs a fresh save instead of returning a dead itemId.
+  itemOperations: defineTable({
+    userId: v.string(),
+    operationId: v.string(),
+    kind: v.union(v.literal("image"), v.literal("link"), v.literal("note")),
+    status: v.union(v.literal("pending"), v.literal("complete")),
+    storageId: v.optional(v.id("_storage")),
+    itemId: v.optional(v.id("items")),
+    updatedAt: v.number(),
+  })
+    // The logical unique key — every mutation loads the row through this index.
+    .index("by_user_operation", ["userId", "operationId"])
+    // deleteItem cleanup: releases ledger rows whose item was deleted so the
+    // same durable operationId can be re-performed. Pending rows have no
+    // itemId and so are never returned by this index lookup.
+    .index("by_item", ["itemId"])
+    // Stale-pending cleanup cron, bounded per run.
+    .index("by_status_updated", ["status", "updatedAt"]),
 });
