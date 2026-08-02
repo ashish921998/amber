@@ -73,7 +73,18 @@ DNS rebinding and is not acceptable as the final implementation.
 | Read Convex rules | `cat convex/_generated/ai/guidelines.md` | exit 0; read first |
 | Focused tests | `bun run test -- convex/model/external-url.test.ts convex/model/safe-fetch.test.ts` | exit 0, all policy tests pass |
 | Full gate | `bun run check` | exit 0 |
-| Unsafe pattern scan | `rg -n 'redirect: "follow"\|response\.(text\|arrayBuffer\|json)\(' convex/ai.ts` | no unbounded user/fixed external fetch consumption remains |
+| Unsafe pattern scan | run the command below the table | no unbounded user/fixed external fetch consumption remains |
+
+The unsafe-pattern scan lives outside the table on purpose. Its regex uses `|`
+alternation, and a Markdown table cell forces a lose-lose: an unescaped `|`
+splits the row, while an escaped `\|` is copied *literally* by an executor and
+then read by `rg` as a literal pipe — so the scan matches nothing and silently
+"passes" while unsafe fetches remain. A fenced block needs no escaping, so it
+renders and copies verbatim:
+
+```sh
+rg -n 'redirect: "follow"|response\.(text|arrayBuffer|json)\(' convex/ai.ts
+```
 
 ## Suggested executor toolkit
 

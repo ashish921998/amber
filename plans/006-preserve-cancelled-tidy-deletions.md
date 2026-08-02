@@ -72,7 +72,17 @@ messages to manufacture a cancellation classification.
 |---|---|---|
 | Focused tests | `bun run test -- src/lib/tidy/use-tidy-actions.test.ts` | exits 0, delete cases pass |
 | Full gate | `bun run check` | exits 0 |
-| Focus cleanup scan | `rg -n 'useFocusEffect|commitDeletes\(\);' 'src/app/(app)/(tabs)/(tidy)/index.tsx'` | no fire-and-forget delete cleanup remains |
+| Focus cleanup scan | run the command below the table | no fire-and-forget delete cleanup remains |
+
+The scan lives outside the table on purpose. Its regex uses `|` alternation,
+which a Markdown table cell can't hold: an unescaped `|` splits the row, and an
+escaped `\|` is copied *literally* by an executor and read by `rg` as a literal
+pipe, so it matches nothing. A fenced block needs no escaping, so it renders and
+copies verbatim:
+
+```sh
+rg -n 'useFocusEffect|commitDeletes\(\);' 'src/app/(app)/(tabs)/(tidy)/index.tsx'
+```
 
 ## Suggested executor toolkit
 
@@ -116,6 +126,13 @@ Refactor `commitDeletes` in `use-tidy-actions.ts`:
 - copy the current queue into an immutable snapshot but do not clear queue,
   history, pending count, or undo state before awaiting native deletion;
 - expose `deleting` and reject/coalesce a second commit while one is in flight;
+- while `deleting` is true, make the snapshot's in-flight entries non-undoable.
+  Their native deletion is already irrevocable, so undo must never appear to
+  restore an entry that the snapshot will still commit on resolve — otherwise
+  the photo is deleted, counted, and marked reviewed while the queue/history
+  says "undone", and the outcome diverges from the undo state. Undo of entries
+  queued *after* the snapshot is unaffected (they are not part of this commit)
+  and may be deferred until `deleting` clears;
 - if the queue is empty, return `nothing` without native work;
 - on resolved native deletion, remove exactly the snapshot entries, clear the
   now-committed history boundary, mark those asset IDs reviewed, call
@@ -137,7 +154,9 @@ Update `handleContinue` in Tidy index:
 - call `loadNextBatch()` only for `deleted` or `nothing`;
 - for `not-deleted`, remain on the Done state with queue/count/undo intact and
   show actions `Try delete again` and `Review decisions`/Undo;
-- disable Continue and toolbar delete while `deleting` is true;
+- disable Continue, toolbar delete, and undo while `deleting` is true (see
+  Step 1 — an in-flight snapshot entry must not be undoable, or the committed
+  delete and the undo state diverge);
 - do not place `loadNextBatch` in a `finally` block.
 
 No `noteDeleted` call occurs on rejection, so the current offset remains valid
