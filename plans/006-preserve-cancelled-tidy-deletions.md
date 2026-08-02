@@ -72,16 +72,22 @@ messages to manufacture a cancellation classification.
 |---|---|---|
 | Focused tests | `bun run test -- src/lib/tidy/use-tidy-actions.test.ts` | exits 0, delete cases pass |
 | Full gate | `bun run check` | exits 0 |
-| Focus cleanup scan | run the command below the table | no fire-and-forget delete cleanup remains |
+| Focus cleanup scan | run the command below the table | exits 0 — no `commitDeletes(` reachable from a `useFocusEffect` callback |
 
-The scan lives outside the table on purpose. Its regex uses `|` alternation,
-which a Markdown table cell can't hold: an unescaped `|` splits the row, and an
-escaped `\|` is copied *literally* by an executor and read by `rg` as a literal
-pipe, so it matches nothing. A fenced block needs no escaping, so it renders and
-copies verbatim:
+The scan lives outside the table on purpose: it is a multi-line block that a
+Markdown table cell can't hold, and a fenced block copies verbatim. It is a
+negative gate that tests the prohibited call directly — a plain
+`rg 'commitDeletes\(\);'` would match the legitimate `await commitDeletes();`
+in `handleContinue` forever and miss spellings like `void commitDeletes()`, so
+instead any `commitDeletes(` following a `useFocusEffect(` fails the gate (a
+match may also span into later code — a false positive is the safe direction;
+inspect the printed lines on failure):
 
 ```sh
-rg -n 'useFocusEffect|commitDeletes\(\);' 'src/app/(app)/(tabs)/(tidy)/index.tsx'
+if rg -n -U '(?s)useFocusEffect\s*\(.*?commitDeletes\s*\(' 'src/app/(app)/(tabs)/(tidy)/index.tsx'; then
+  echo "commitDeletes must not run from useFocusEffect"
+  exit 1
+fi
 ```
 
 ## Suggested executor toolkit
@@ -125,7 +131,9 @@ Refactor `commitDeletes` in `use-tidy-actions.ts`:
 - return the `DeleteCommitResult` union above;
 - copy the current queue into an immutable snapshot but do not clear queue,
   history, pending count, or undo state before awaiting native deletion;
-- expose `deleting` and reject/coalesce a second commit while one is in flight;
+- expose `deleting` and coalesce a second commit while one is in flight into
+  the in-flight commit's result (do not reject it — callers have no defined
+  rejection handling);
 - while `deleting` is true, make the snapshot's in-flight entries non-undoable.
   Their native deletion is already irrevocable, so undo must never appear to
   restore an entry that the snapshot will still commit on resolve — otherwise
@@ -134,6 +142,11 @@ Refactor `commitDeletes` in `use-tidy-actions.ts`:
   queued *after* the snapshot is unaffected (they are not part of this commit)
   and may be deferred until `deleting` clears;
 - if the queue is empty, return `nothing` without native work;
+- snapshot identity: `onDecision` pushes the same `TidyPhoto` object into both
+  the queue and `historyRef`, so match by object reference (or `photo.id`) —
+  remove only `action: 'delete'` history entries whose photo is in the
+  snapshot; keep/save entries (including saves with unresolved `itemId`
+  promises) and deletes queued after the snapshot must survive untouched;
 - on resolved native deletion, remove exactly the snapshot entries, clear the
   now-committed history boundary, mark those asset IDs reviewed, call
   `noteDeleted(snapshot.length)`, increment count, and return `deleted`;
@@ -150,6 +163,10 @@ resolve, after resolve, and after reject/cancel.
 
 Update `handleContinue` in Tidy index:
 
+- guard `handleContinue` itself with a synchronous in-flight flag (a ref, not
+  state — `deleting`/`continuing` state lands a render late, so a same-frame
+  double tap enters twice): the second entry returns immediately, so exactly
+  one handler commits and paginates even when `commitDeletes` coalesces;
 - await `commitDeletes`;
 - call `loadNextBatch()` only for `deleted` or `nothing`;
 - for `not-deleted`, remain on the Done state with queue/count/undo intact and
@@ -183,7 +200,7 @@ session.
 If product requires a leave warning later, implement it as a separate navigation
 guard plan. Do not block this fix on custom back interception.
 
-**Verify**: focus cleanup scan returns no fire-and-forget call; `bun run lint`
+**Verify**: focus cleanup scan exits 0 (any match fails it); `bun run lint`
 has no now-unused imports.
 
 ### Step 4: Preserve all plan-005 save invariants
@@ -226,8 +243,13 @@ reviewed flags, and offset compensation must occur only on confirmed success.
 - Empty queue returns `nothing` and makes no native call.
 - Deferred native call leaves queue/history/counts intact.
 - Success commits exact snapshot once and calls `noteDeleted` once.
+- Mixed history under a deferred commit — an unresolved save, a snapshotted
+  delete, and a delete queued after the snapshot: success removes only the
+  snapshotted delete (save recovery and the newer delete survive); cancellation
+  preserves all three.
 - Rejection/cancellation commits nothing and permits retry.
-- Double tap creates one native request.
+- Double tap creates one native request, one `noteDeleted()`, and one
+  `loadNextBatch()` call.
 - Continue advances only on `deleted`/`nothing`.
 - Undo works after cancellation; durable save tests from plan 005 remain green.
 - Manual iOS confirmation cancellation and Android behavior from step 5.

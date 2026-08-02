@@ -83,8 +83,12 @@ then read by `rg` as a literal pipe — so the scan matches nothing and silently
 renders and copies verbatim:
 
 ```sh
-rg -n 'redirect: "follow"|response\.(text|arrayBuffer|json)\(' convex/ai.ts
+rg -n '\bfetch\(|redirect: "follow"|response\.(text|arrayBuffer|json)\(' convex/ -g '!**/safe-fetch.ts' -g '!**/_generated/**' -g '!**/*.test.ts'
 ```
+
+The scan covers all backend files, not just `convex/ai.ts`, so an unsafe fetch
+added elsewhere still fails it; `convex/model/safe-fetch.ts` is the single
+audited allowlist exclusion.
 
 ## Suggested executor toolkit
 
@@ -157,8 +161,12 @@ mutations and Node actions can use it. It should:
 - trim input and prepend `https://` only when no scheme is present;
 - parse with `new URL`;
 - accept only `http:` and `https:`;
-- reject username/password, empty hostname, invalid/non-default port forms, and
-  overlong URLs;
+- reject username/password, empty hostname, invalid ports, and any explicit
+  non-default port (e.g. `:8080`); explicit default ports (`http://…:80`,
+  `https://…:443`) are dropped by the URL serializer's canonical form and are
+  accepted;
+- reject URLs longer than 2048 UTF-16 code units (string `.length`) after
+  normalization;
 - normalize to the URL serializer's canonical string;
 - return a typed policy error category, not internal parser text.
 
@@ -167,7 +175,7 @@ Use it in `createLinkItem` before inserting. Remove the current regex-based
 
 **Verify**: URL tests cover bare domain, HTTP/HTTPS, file/gopher/data/javascript,
 credentials, empty host, fragments/query, decimal/hex/short IPv4 canonicalization,
-IPv6 literals, and overlong input.
+IPv6 literals, explicit default vs. non-default ports, and length-boundary input.
 
 ### Step 3: Build the connection-bound safe fetcher
 
@@ -179,17 +187,23 @@ resolver/transport/clock for deterministic tests. It must:
 - reject if any DNS answer is unsafe, rather than selecting a convenient public
   answer from a mixed set;
 - use the validated lookup callback on the actual connection;
-- set redirect mode to manual and follow at most 3 redirects;
+- set redirect mode to manual and follow at most 3 redirect hops after the
+  initial request (the fourth redirect returns `redirect_limit`);
 - resolve relative `Location` against the current URL, then re-run URL and DNS
-  policy for every hop;
-- apply one total deadline with `AbortController`, not a fresh unlimited budget
-  per redirect;
+  policy for every hop, and cancel each redirect response body before issuing
+  the next request;
+- apply one total deadline with `AbortController` that starts before DNS
+  resolution and covers it — a resolver that never completes must still time
+  out — not a fresh unlimited budget per redirect;
 - provide bounded streaming readers that check `Content-Length` when present and
   still stop after actual bytes exceed the limit;
 - cancel the reader/response on limit breach;
 - return policy error codes such as `invalid_url`, `blocked_destination`,
   `redirect_limit`, `timeout`, `unsupported_content_type`, `response_too_large`,
-  and `http_error`.
+  and `http_error`;
+- expose only a narrow result type — bounded body bytes/reader, the final
+  validated URL, status, and sanitized metadata — never the underlying
+  `Response`, whose `text()`/`json()`/`arrayBuffer()` would bypass the limits.
 
 Do not log raw URLs with credentials/query strings. The parser rejects embedded
 credentials, but SerpAPI carries its key in the query and must be redacted.
@@ -220,6 +234,11 @@ Replace direct page/image `fetch` calls in `convex/ai.ts`:
 - A blocked/missing hero image remains best-effort and returns no aspect ratio;
   a blocked primary page fetch is a core processing failure with a sanitized log
   category.
+- Update the `catch` handlers in `convex/ai.ts` that currently log the raw
+  caught error object (`processItem`, `recommendForSpace`, `findProductLinks`):
+  for fetch-policy failures they must log only the policy error code and item
+  identifier — never the error object, its `cause`, URLs, headers, response
+  bodies, or resolved addresses.
 
 Remove `redirect: "follow"` and all unbounded page/image body methods.
 
@@ -262,9 +281,15 @@ PR notes without probing real internal services.
 
 - Syntactic parser matrix from step 2.
 - DNS/IP matrix: all private/reserved classes, mapped IPv6, mixed answers, public.
-- Redirects: public chain, relative location, private hop, loop, over limit.
-- Resources: timeout, declared oversize, streamed oversize, missing length,
-  allowed/rejected content types.
+- Redirects: public chain, relative location, private hop, non-HTTP-scheme
+  (`file:`/`data:`/`javascript:`), credentialed, malformed, and overlong
+  `Location` values (each rejected with no connection started), a redirect
+  response with a large body (cancelled, not buffered), loop, and the count
+  boundary (third hop allowed, fourth rejected).
+- Resources: timeout (including a resolver that never completes), declared
+  oversize, streamed oversize, missing length, allowed/rejected content types.
+- Redaction: logged/thrown policy errors contain no credentials, query strings,
+  redirect locations, response bodies, or resolved addresses.
 - Call sites: public page success, blocked hero as best-effort, blocked page as
   core failure, bounded/redacted SerpAPI error.
 - All network tests use injected resolver/transport; no live endpoints.

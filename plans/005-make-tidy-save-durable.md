@@ -152,8 +152,12 @@ Create recovery orchestration that runs before the first photo batch query when
 Tidy mounts with permission:
 
 - list pending records;
-- skip/clean records already marked reviewed;
-- for active records, call the shared saver with the existing operation ID;
+- process `cancelled` records first — a crash during undo can leave a photo
+  both reviewed and cancelled, and the reviewed shortcut must not skip it;
+- skip/clean remaining records already marked reviewed;
+- for active records (state `pending` only — `failed` and `cancelled` records
+  stay recovery-owned and are never auto-retried on mount), call the shared
+  saver with the existing operation ID;
 - on success, complete the reviewed transition;
 - on failure, mark the durable record `failed` so it survives restart and
   stays visible for user retry; never auto-retry continuously;
@@ -161,12 +165,20 @@ Tidy mounts with permission:
   `getImportOperation({ operationId })` to learn whether the save completed
   server-side; never use `beginImageImport` as the probe (it creates/refreshes a
   backend row). If it returned `complete` with an `itemId`, delete that item
-  (plan 003 makes `deleteItem` release the ledger) and then remove the pending
-  record; if `pending`/`null`, just remove the cancelled pending record.
+  (plan 003 makes `deleteItem` release the ledger) and only after the delete
+  succeeds unmark reviewed and remove the pending record — a failed or
+  ambiguous delete preserves the record for the next recovery pass; if
+  `pending`/`null`, unmark reviewed (if set) and remove the cancelled pending
+  record.
 
 Expose `recovering`, failed count, `retryFailed`, and an explicit
-`releaseFailedToDeck` action. Releasing removes pending without marking reviewed,
-so the photo can reappear on a reset query.
+`releaseFailedToDeck` action. `retryFailed` re-runs the shared saver with the
+record's existing operation ID. Releasing removes pending without marking
+reviewed, so the photo can reappear on a reset query — but a failure can be
+ambiguous (the finalize may have landed server-side), so before releasing,
+probe `getImportOperation`: on `complete`, the item exists — complete the
+reviewed transition instead of releasing (a re-swipe would mint a new
+operation ID and duplicate the item); release only on `pending`/`null`.
 
 **Verify**: orchestration tests simulate backend already-complete, upload
 failure, finalize failure, and process restart; each operation ID must remain
@@ -233,9 +245,11 @@ In Tidy screen/index and `TidyDone`:
 - permit Continue only when every save is either confirmed, undone, or
   explicitly released back to the deck.
 
-`use-photo-batch.ts` may exclude pending records while recovery owns them, but
-must include released/failed records after a reset. Avoid advancing past a
-pending asset with no recovery UI.
+`use-photo-batch.ts` must exclude pending *and* failed records while recovery
+owns them (its current collector filters only `isReviewed`, which would deal a
+failed photo back into the deck), and include them again only after an explicit
+release followed by a query reset. Avoid advancing past a pending asset with no
+recovery UI.
 
 **Verify**: `bun run check` → exit 0; manual screen test shows no Continue button
 can abandon a pending/failed save.

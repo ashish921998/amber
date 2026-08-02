@@ -130,7 +130,9 @@ two intentional items → focused Convex tests pass.
 Create `src/lib/share/storage.ts` using a dedicated MMKV instance. Persist:
 
 - a fingerprint of the current raw `sharedPayloads` including order and
-  duplicates;
+  duplicates, built from an unambiguous encoding of each payload's
+  `value`/`shareType`/`mimeType` (e.g., a JSON array — never delimiter
+  concatenation) so distinct batches cannot collide;
 - a random session UUID;
 - each resolved entry's stable operation ID (`share:<session>:<index>`), kind,
   and status (`pending`, `saved`, `failed`, or `unsupported`);
@@ -138,7 +140,10 @@ Create `src/lib/share/storage.ts` using a dedicated MMKV instance. Persist:
 - session phase (`active` or `complete`).
 
 Use an ordered occurrence index so two identical entries in one batch remain
-distinct. Reuse the session only when the current raw fingerprint matches.
+distinct. `<index>` is the entry's position in the raw `sharedPayloads` array
+(the same order the fingerprint encodes), never the resolved array's index; if
+raw and resolved counts diverge, treat it as a resolution error rather than
+guessing alignment. Reuse the session only when the current raw fingerprint matches.
 Persist `phase: complete` before calling the native clear function. On remount:
 
 - matching active session resumes only pending/failed entries;
@@ -192,11 +197,16 @@ Replace the spinner-only `share.tsx` UI:
 - partial/failed: list or concise count of successes/failures with `Retry failed`,
   `Continue with saved`, and `Cancel`;
 - complete: mark persistent session complete, clear native payloads, delete local
-  session after clear, and replace Home exactly once.
+  session only after `clearSharedPayloads()` returns without throwing — a
+  throwing clear keeps the completed session (no delete, no navigation) so
+  remount reconciliation retries the clear — and replace Home exactly once.
 
 On `Continue with saved`, persist complete before clearing; explain that failed
-entries will be discarded. On `Cancel`, do not claim success. Navigation and
-clear must be centralized in one idempotent completion function.
+entries will be discarded. On `Cancel`, do not claim success; Cancel is
+terminal and runs the same persist-terminal-phase → native clear → delete-session
+sequence as completion, so a later identical re-share never matches a stale
+session. Navigation and clear must be centralized in one idempotent completion
+function.
 
 Use existing theme typography/buttons rather than adding a design system.
 
@@ -230,7 +240,8 @@ unacknowledged failure is a failed verification.
 - Processor tests: all success, partial failure, retry, malformed, unsupported,
   duplicate invocation, result ordering.
 - Storage/session tests: active resume, complete-before-clear resume,
-  clear-before-local-delete cleanup, new fingerprint, duplicate payload entries.
+  clear-before-local-delete cleanup, new fingerprint, duplicate payload entries,
+  cancel followed by an identical re-share starting a fresh session.
 - Manual iOS/Android matrix from step 5.
 - Verification: focused tests and `bun run check` pass.
 

@@ -192,7 +192,10 @@ not duplicate/overwrite user-owned membership decisions.
 ### Step 5: Guard steering writes against stale purpose/lifecycle
 
 Make `steerItemForSpace` retry optional failures with the same bounded-attempt
-pattern, but before writing:
+pattern, but perform these re-checks **inside the `setMembershipIntentsInternal`
+mutation transaction** (action-level pre-reads can race user edits and are only
+a fast path; the mutation's existing in-transaction saved-status check is the
+model), before writing:
 
 - re-check item still exists and is ready;
 - re-check the membership still exists and is effectively `saved`;
