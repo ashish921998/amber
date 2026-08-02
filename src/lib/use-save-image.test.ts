@@ -203,6 +203,47 @@ describe("saveImageOperations", () => {
     expect(failed.message).not.toContain(itemId);
   });
 
+  it("passes image metadata and spaceId through to finalize", async () => {
+    // A regression that drops spaceId (image filed to the wrong space) or
+    // aspectRatio/isSticker/capturedAt/location must not pass silently.
+    const finalizeInputs: unknown[] = [];
+    const deps = makeDeps({
+      finalize: async (input) => {
+        finalizeInputs.push(input);
+        return "final-item" as never;
+      },
+    });
+    await saveImageOperations(
+      [
+        {
+          image: {
+            uri: "a",
+            width: 300,
+            height: 200,
+            isSticker: true,
+            capturedAt: 1234,
+            latitude: 12.5,
+            longitude: -70.25,
+          },
+          operationId: "image:op-a",
+        },
+      ],
+      deps,
+      { spaceId: "space-1" as never },
+    );
+    expect(finalizeInputs).toEqual([
+      {
+        operationId: "image:op-a",
+        aspectRatio: 300 / 200,
+        isSticker: true,
+        capturedAt: 1234,
+        latitude: 12.5,
+        longitude: -70.25,
+        spaceId: "space-1",
+      },
+    ]);
+  });
+
   it("falls back to a generic message when the thrown value is not an Error", async () => {
     const deps = makeDeps({
       upload: async () => {

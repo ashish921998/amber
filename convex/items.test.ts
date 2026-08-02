@@ -279,14 +279,14 @@ describe("image import lifecycle", () => {
 
     // A stale pending operation with an attached upload (process died between
     // upload and finalize). Its storage should be swept.
+    const staleStorageId = await storeBlob(t);
     await t.run(async (ctx) => {
-      const storageId = await ctx.storage.store(new Blob([new Uint8Array([1, 2, 3])]));
       await ctx.db.insert("itemOperations", {
         userId: "user-a",
         operationId: OP_ID,
         kind: "image",
         status: "pending",
-        storageId,
+        storageId: staleStorageId,
         // One hour past the staleness cutoff.
         updatedAt: Date.now() - STALE_IMPORT_CUTOFF_MS - 60 * 60 * 1000,
       });
@@ -312,6 +312,10 @@ describe("image import lifecycle", () => {
       operationId: OP_ID,
     });
     expect(staleOp).toBeNull();
+    const staleBlob = await t.run(async (ctx) =>
+      ctx.db.system.get("_storage", staleStorageId),
+    );
+    expect(staleBlob).toBeNull();
 
     // Fresh op + its blob survive.
     const freshOp = await t.query(api.items.getImportOperation, {
@@ -572,6 +576,46 @@ describe("image import lifecycle", () => {
       ctx.db.system.get("_storage", storageId),
     );
     expect(blobGone).toBeNull();
+  });
+
+  it("recycles an inconsistent complete op (no itemId) and clears its stale storageId", async () => {
+    // Defensive branch: a complete row with no itemId. Recycling must clear
+    // the stale storageId — left in place, attach would treat it as canonical
+    // and delete the fresh re-upload as "redundant".
+    const t = as("user-a");
+    const staleBlob = await storeBlob(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("itemOperations", {
+        userId: "user-a",
+        operationId: OP_ID,
+        kind: "image",
+        status: "complete",
+        storageId: staleBlob,
+        updatedAt: Date.now(),
+      });
+    });
+
+    const began = await t.mutation(api.items.beginImageImport, {
+      operationId: OP_ID,
+    });
+    expect(began.kind).toBe("upload");
+    const op = await t.query(api.items.getImportOperation, {
+      operationId: OP_ID,
+    });
+    expect(op?.status).toBe("pending");
+    expect(op?.storageId).toBeUndefined();
+
+    // A fresh upload then attaches and finalizes normally.
+    const freshBlob = await storeBlob(t);
+    await t.mutation(api.items.attachImageUpload, {
+      operationId: OP_ID,
+      storageId: freshBlob,
+    });
+    const itemId = await t.mutation(api.items.finalizeImageImport, {
+      operationId: OP_ID,
+    });
+    const item = await t.run(async (ctx) => await ctx.db.get(itemId));
+    expect(item?.storageId).toBe(freshBlob);
   });
 
   it("rejects operation ids outside the allowed length bounds", async () => {

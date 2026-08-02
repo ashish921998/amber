@@ -490,8 +490,21 @@ export const beginImageImport = mutation({
         }
         return { kind: "complete", itemId: op.itemId };
       }
-      // Defensive: a complete row with no itemId is inconsistent; recycle it.
-      await ctx.db.patch(op._id, { status: "pending", updatedAt: now });
+      // Defensive: a complete row with no itemId is inconsistent; recycle it
+      // the same way as above — release the blob (guarded) and CLEAR the stale
+      // storageId, otherwise attach would treat it as canonical and delete the
+      // fresh re-upload as "redundant".
+      if (
+        op.storageId !== undefined &&
+        (await isStorageUnreferenced(ctx, op.storageId, op._id))
+      ) {
+        await safeDeleteStorage(ctx, op.storageId);
+      }
+      await ctx.db.patch(op._id, {
+        status: "pending",
+        storageId: undefined,
+        updatedAt: now,
+      });
       return {
         kind: "upload",
         uploadUrl: await ctx.storage.generateUploadUrl(),
@@ -825,7 +838,7 @@ export const deleteItem = mutation({
     const operations = await ctx.db
       .query("itemOperations")
       .withIndex("by_item", (q) => q.eq("itemId", item._id))
-      .take(10);
+      .collect();
     for (const op of operations) {
       await ctx.db.delete(op._id);
     }
