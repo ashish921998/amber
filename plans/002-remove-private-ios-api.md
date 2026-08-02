@@ -51,7 +51,7 @@ provide spatially varying live blur radius.
 | Purpose | Command | Expected on success |
 |---|---|---|
 | Full JS gate | `bun run check` | exit 0 |
-| Private source scan | `rg -n 'CAFilter|variableBlur|NSClassFromString|NSSelectorFromString|filterWithType|inputMaskImage|base64Decode' modules/progressive-blur` | exit 1, no matches |
+| Private source scan | `rg -n -e 'CAFilter' -e 'variableBlur' -e 'NSClassFromString' -e 'NSSelectorFromString' -e 'filterWithType' -e 'inputMaskImage' -e 'base64Decode' modules/progressive-blur` | exit 1, no matches |
 | Native build | `xcodebuild -workspace ios/amber.xcworkspace -scheme amber -configuration Release -sdk iphonesimulator -derivedDataPath /tmp/amber-private-api-check CODE_SIGNING_ALLOWED=NO build` | exit 0, `** BUILD SUCCEEDED **` |
 
 ## Suggested executor toolkit
@@ -127,10 +127,36 @@ and the built app/module artifacts:
 ```bash
 APP=$(find /tmp/amber-private-api-check/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' -print -quit)
 test -n "$APP"
-strings "$APP/amber" | rg 'CAFilter|variableBlur|filterWithType:|inputMaskImage'
+BINARY="$APP/amber"
+test -f "$BINARY" && test -r "$BINARY"
+
+SCAN_OUTPUT=$(mktemp)
+if strings "$BINARY" > "$SCAN_OUTPUT"; then
+  strings_status=0
+else
+  strings_status=$?
+fi
+if rg \
+  -e 'CAFilter' \
+  -e 'variableBlur' \
+  -e 'NSClassFromString' \
+  -e 'NSSelectorFromString' \
+  -e 'filterWithType' \
+  -e 'inputMaskImage' \
+  -e 'base64Decode' \
+  "$SCAN_OUTPUT"; then
+  rg_status=0
+else
+  rg_status=$?
+fi
+rm -f "$SCAN_OUTPUT"
+test "$strings_status" -eq 0 && test "$rg_status" -eq 1
 ```
 
-The `strings | rg` command must exit 1 with no output. If another dependency
+`strings` must exit 0 and `rg` must exit 1 with no output. The `test -f && test -r`
+guard and the `strings_status` check are load-bearing: without them a `strings`
+failure (missing/unreadable binary, wrong path) yields empty output, `rg` exits 1
+on the empty input, and the pipeline falsely reports a clean pass. If another dependency
 contains one of these strings, do not hide the result. This app is a prebuilt
 bare-workflow build where every pod is statically linked into the single
 `$APP/amber` binary, so "identify its binary and STOP" is not always

@@ -49,7 +49,18 @@ export default function ShareScreen() {
             else await createNoteItem({ text: value });
           }
         }
-        if (images.length > 0) await saveImages(images);
+        if (images.length > 0) {
+          // Plan 004 owns the recoverable share state machine; here we minimally
+          // consume the settled result type and treat any failed image as a
+          // logged failure. The per-image operation ids are retained in the
+          // result for that future recovery.
+          const results = await saveImages(images.map((image) => ({ image })));
+          for (const result of results) {
+            if (result.status === 'failed') {
+              console.error('Shared image import failed:', result.operationId, result.stage);
+            }
+          }
+        }
       } catch (err) {
         console.error('Saving shared content failed:', err);
       } finally {
