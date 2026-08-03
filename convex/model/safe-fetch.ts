@@ -473,7 +473,11 @@ async function safeFetchThrowing(
         );
       }
       const contentType = String(response.headers["content-type"] ?? "");
-      if (!allowContentType(contentType)) {
+      // Media types are case-insensitive (RFC 9110 §8.3.1). Call-site predicates
+      // match lowercase literals (text/html, image/, application/json), so a
+      // server sending `Text/HTML` or `IMAGE/JPEG` would wrongly be rejected.
+      // Lowercase once here so every predicate sees a normalized value.
+      if (!allowContentType(contentType.toLowerCase())) {
         await safeDump(response.body);
         throw new SafeFetchErrorClass(
           "unsupported_content_type",

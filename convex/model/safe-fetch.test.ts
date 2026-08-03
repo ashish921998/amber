@@ -369,6 +369,23 @@ describe("safeFetch HTTP policy", () => {
     }
   });
 
+  it("normalizes content type case-insensitively (RFC 9110)", async () => {
+    // A server may send "Text/HTML"; call-site predicates match lowercase, so
+    // the fetcher must lowercase the header before invoking the predicate.
+    const agent = mockDispatcher();
+    agent
+      .get("http://a.test")
+      .intercept({ method: "GET", path: "/" })
+      .reply(200, "ok", { headers: { "content-type": "Text/HTML" } });
+    const result = await safeFetch("http://a.test/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: agent,
+      allowContentType: (ct) => ct.startsWith("text/html"),
+    });
+    expect(result.ok).toBe(true);
+  });
+
   it("rejects a lying Content-Length over the cap", async () => {
     const agent = mockDispatcher();
     agent
