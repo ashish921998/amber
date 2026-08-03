@@ -112,11 +112,17 @@ function assertHostAllowed(url: string): void {
   if (hostname === "") {
     throw new SafeFetchErrorClass("blocked_destination", "missing host");
   }
-  // Strip IPv6 brackets already handled by URL.hostname (it returns the bare
-  // address inside brackets-less). Try to parse as an IP literal.
-  let parsed: ipaddr.IPv4 | ipaddr.IPv6 | null = null;
+  // URL.hostname returns IPv6 literals WITH surrounding brackets, e.g.
+  // http://[::1]/ -> "[::1]". ipaddr.parse rejects the bracketed form, so a
+  // bracketed host would be misclassified as a DNS name and skip this gate.
+  // Strip the brackets before attempting an IP-literal parse.
+  if (hostname.startsWith("[") && hostname.endsWith("]")) {
+    hostname = hostname.slice(1, -1);
+  }
+  // Try to parse as an IP literal. If it parses, classify it here because
+  // Node's net.connect does NOT call connect.lookup for IP literals.
   try {
-    parsed = ipaddr.parse(hostname);
+    ipaddr.parse(hostname);
   } catch {
     // Not an IP literal — it's a DNS name; the validating lookup handles it.
     return;
@@ -150,18 +156,22 @@ export const defaultResolver: DnsResolver = async (hostname) => {
 /**
  * Build the validating undici `lookup` for a single connection. It resolves the
  * hostname, checks EVERY answer (a single private answer in a mixed set fails
- * the whole request), and returns only the chosen public address to the socket.
- * Returning a single validated address to net/tls.connect is what binds the
- * check to the connection actually used.
+ * the whole request), and returns only validated public addresses to the socket.
+ * Returning validated addresses to net/tls.connect is what binds the check to
+ * the connection actually used.
+ *
+ * Honors the `all` option in the lookup call: undici invokes connect.lookup with
+ * `{ all: true }`, whose callback contract is `callback(err, addresses[])`; when
+ * `all` is absent/false the contract is `callback(err, address, family)`.
  */
 export function makeValidatingLookup(resolver: DnsResolver) {
   return async (
     hostname: string,
-    _options: unknown,
+    options: { all?: boolean } | null,
     callback: (
       err: NodeJS.ErrnoException | null,
-      address: string,
-      family: number,
+      addressOrAddresses: string | LookupAddress[] | null,
+      family?: number,
     ) => void,
   ): Promise<void> => {
     let addresses: readonly LookupAddress[];
@@ -192,8 +202,14 @@ export function makeValidatingLookup(resolver: DnsResolver) {
         return;
       }
     }
-    // All answers are public; hand the first to the socket. The others having
-    // already passed validation means rebinding to them later is still safe.
+    // All answers are public. Return them in the shape the caller asked for:
+    // the array form for all:true (what undici requests), the single-address
+    // form otherwise. Both carry only already-validated addresses, so rebinding
+    // to any of them later is still safe.
+    if (options !== null && options.all === true) {
+      callback(null, [...addresses] as LookupAddress[], undefined);
+      return;
+    }
     const chosen = addresses[0];
     callback(null, chosen.address, chosen.family);
   };
@@ -206,6 +222,22 @@ export function makeSafeDispatcher(resolver: DnsResolver = defaultResolver): Dis
   return new Agent({
     connect: { lookup: makeValidatingLookup(resolver) as never },
   });
+}
+
+/**
+ * A single shared production dispatcher (Agent) reused across safeFetch calls.
+ * undici Agents own a connection pool; creating one per request defeats pooling
+ * and leaks sockets. This Agent is created once per process with the default
+ * validating resolver. Tests inject their own dispatcher and never touch this.
+ */
+let sharedDispatcher: Dispatcher | undefined;
+
+/** Return the process-wide shared validating dispatcher, creating it on first use. */
+export function getSharedDispatcher(): Dispatcher {
+  if (sharedDispatcher === undefined) {
+    sharedDispatcher = makeSafeDispatcher(defaultResolver);
+  }
+  return sharedDispatcher;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +368,7 @@ async function safeFetchThrowing(
     allowContentType = () => true,
     headers = {},
     maxRedirects = DEFAULT_MAX_REDIRECTS,
-    dispatcher = makeSafeDispatcher(),
+    dispatcher = getSharedDispatcher(),
   } = options;
 
   // Re-validate the URL syntactically on entry. external-url enforces scheme,
@@ -486,8 +518,10 @@ async function dispatch(
     if (signal.aborted) {
       throw new SafeFetchErrorClass("timeout", "deadline exceeded");
     }
-    if (err !== null && typeof err === "object" && "code" in err) {
-      // ECONNREFUSED is how our validating lookup blocks a private destination.
+    // The validating lookup blocks a private destination with ECONNREFUSED.
+    // Map only that marker to blocked_destination so a genuine network failure
+    // (ECONNRESET, EHOSTUNREACH, etc.) is reported as fetch_failed instead.
+    if (err !== null && typeof err === "object" && err.code === "ECONNREFUSED") {
       throw new SafeFetchErrorClass("blocked_destination", "request failed");
     }
     throw new SafeFetchErrorClass("fetch_failed", "request failed");

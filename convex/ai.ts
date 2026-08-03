@@ -380,9 +380,9 @@ export function isPageFetchBlockedError(
 
 /**
  * Reduce a caught error to a safe log category. Fetch-policy errors expose only
- * their stable code; anything else is a generic "unexpected_error". Never
- * returns the error's message or cause, which may carry a URL, response body,
- * or resolved address. Used by the action catch handlers.
+ * their stable code; anything else retains the error's constructor name (e.g.
+ * TypeError) for observability without leaking data — never the error's message
+ * or cause, which may carry a URL, response body, or resolved address.
  */
 function summarizeError(error: unknown): string {
   if (isPageFetchBlockedError(error)) {
@@ -390,6 +390,11 @@ function summarizeError(error: unknown): string {
   }
   if (isSafeFetchError(error)) {
     return `safe_fetch:${error.code}`;
+  }
+  // Include the constructor name so genuine bugs are diagnosable in logs; the
+  // name (TypeError, RangeError, ...) carries no user/request data.
+  if (error !== null && typeof error === "object" && "name" in error) {
+    return `unexpected_error:${String(error.name)}`;
   }
   return "unexpected_error";
 }
@@ -865,6 +870,11 @@ export const recommendForSpace = internalAction({
 const productQuerySchema = z.object({
   query: z
     .string()
+    // Bound the model-provided query so the SerpAPI request URL (fixed prefix +
+    // percent-encoded query + API key) stays well under safeFetch's 2047-char
+    // URL cap. A real product query is a few words; this only guards a runaway
+    // model output.
+    .max(500)
     .describe(
       "A concise shopping search query for the primary product: brand (if identifiable) + product type + distinguishing attributes, e.g. 'west elm leather sofa cognac'. Empty string if there is no identifiable product.",
     ),
@@ -1036,13 +1046,11 @@ export const findProductLinks = internalAction({
       });
     } catch (error) {
       // Sanitized error log: never the raw error object (which may carry the
-      // request URL with the API key, or a response body). Log only a category
-      // and the item id.
+      // request URL with the API key, or a response body). summarizeError
+      // reduces fetch-policy errors to a code and everything else to a category.
       console.error(
         `findProductLinks failed for ${args.itemId}:`,
-        isSafeFetchError(error) || isPageFetchBlockedError(error)
-          ? (error as { code?: string }).code
-          : "unexpected_error",
+        summarizeError(error),
       );
       await fail();
     }

@@ -84,13 +84,34 @@ describe("isPublicAddress", () => {
 // end-to-end that a poisoned lookup prevents a real connection.
 // ---------------------------------------------------------------------------
 
-/** Promisify the node-style callback signature makeValidatingLookup returns. */
+/** Promisify the node-style callback signature makeValidatingLookup returns,
+ * in the single-address form (all:false / absent). */
 async function runLookup(
   lookup: ReturnType<typeof makeValidatingLookup>,
   hostname: string,
 ): Promise<{ err: NodeJS.ErrnoException | null; address: string; family: number }> {
   return new Promise((resolve) => {
-    lookup(hostname, {}, (err, address, family) => resolve({ err, address, family }));
+    lookup(hostname, {}, (err, address, family) =>
+      resolve({ err, address: address as string, family: family as number }),
+    );
+  });
+}
+
+/** Promisify the lookup in the all:true form (what undici actually requests). */
+async function runLookupAll(
+  lookup: ReturnType<typeof makeValidatingLookup>,
+  hostname: string,
+): Promise<{
+  err: NodeJS.ErrnoException | null;
+  addresses: import("node:dns").LookupAddress[] | null;
+}> {
+  return new Promise((resolve) => {
+    lookup(hostname, { all: true }, (err, addresses) =>
+      resolve({
+        err,
+        addresses: addresses as import("node:dns").LookupAddress[] | null,
+      }),
+    );
   });
 }
 
@@ -142,6 +163,27 @@ describe("makeValidatingLookup (connection-bound DNS)", () => {
     });
     const { err } = await runLookup(lookup, "broken.test");
     expect(err?.code).toBe("ESERVFAIL");
+  });
+
+  it("returns the array form when called with all:true (undici's actual shape)", async () => {
+    // undici invokes connect.lookup with { all: true }, whose callback contract
+    // is callback(err, addresses[]). Returning the single-address form here
+    // breaks every DNS-hostname fetch with "Invalid IP address: undefined".
+    const lookup = makeValidatingLookup(resolverFor(["8.8.8.8", "1.1.1.1"]));
+    const { err, addresses } = await runLookupAll(lookup, "public.test");
+    expect(err).toBeNull();
+    expect(addresses).toEqual([
+      { address: "8.8.8.8", family: 4 },
+      { address: "1.1.1.1", family: 4 },
+    ]);
+  });
+
+  it("blocks in the all:true form too when an answer is private", async () => {
+    const lookup = makeValidatingLookup(resolverFor(["8.8.8.8", "127.0.0.1"]));
+    const { err, addresses } = await runLookupAll(lookup, "mixed.test");
+    expect(err?.code).toBe("ECONNREFUSED");
+    // On error the lookup returns no address array (the second arg is unused).
+    expect(Array.isArray(addresses)).toBe(false);
   });
 });
 
@@ -364,71 +406,98 @@ describe("safeFetch HTTP policy", () => {
 // IP-literal SSRF: Node's net.connect does NOT call connect.lookup for IP
 // literals, so http://127.0.0.1/ would bypass the validating DNS lookup and
 // connect straight to loopback. assertHostAllowed classifies IP-literal hosts
-// before the request. These tests prove that gate (no dispatcher needed — the
-// block happens before any dispatch).
+// before the request. These tests use a RECORDING dispatcher and assert
+// request() is NEVER called — proving the block happens before dispatch, not
+// as a side effect of the dispatcher refusing the connection.
 // ---------------------------------------------------------------------------
 
+/** A dispatcher that records whether request() was ever invoked. Any call
+ * means the SSRF gate FAILED to block the URL before dispatch. */
+function recordingDispatcher(): { dispatcher: Dispatcher; called: () => boolean } {
+  let called = false;
+  const dispatcher = {
+    request() {
+      called = true;
+      return Promise.reject(new Error("should not have been called"));
+    },
+  } as unknown as Dispatcher;
+  return { dispatcher, called: () => called };
+}
+
 describe("safeFetch IP-literal SSRF block", () => {
-  it("rejects loopback IP literals", async () => {
+  it("rejects loopback IP literals before dispatch", async () => {
+    const rec = recordingDispatcher();
     const result = await safeFetch("http://127.0.0.1/", {
       timeoutMs: 2000,
       maxBytes: 1024,
-      dispatcher: mockDispatcher(),
+      dispatcher: rec.dispatcher,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe("blocked_destination");
     }
+    expect(rec.called()).toBe(false);
   });
 
-  it("rejects RFC1918 private IP literals", async () => {
+  it("rejects RFC1918 private IP literals before dispatch", async () => {
     for (const ip of ["10.0.0.1", "172.16.0.1", "192.168.1.1"]) {
+      const rec = recordingDispatcher();
       const result = await safeFetch(`http://${ip}/`, {
         timeoutMs: 2000,
         maxBytes: 1024,
-        dispatcher: mockDispatcher(),
+        dispatcher: rec.dispatcher,
       });
       expect(result.ok).toBe(false);
       if (!result.ok) {
         expect(result.code).toBe("blocked_destination");
       }
+      expect(rec.called()).toBe(false);
     }
   });
 
-  it("rejects cloud-metadata link-local IP literal", async () => {
+  it("rejects cloud-metadata link-local IP literal before dispatch", async () => {
+    const rec = recordingDispatcher();
     const result = await safeFetch("http://169.254.169.254/latest/meta-data/", {
       timeoutMs: 2000,
       maxBytes: 1024,
-      dispatcher: mockDispatcher(),
+      dispatcher: rec.dispatcher,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe("blocked_destination");
     }
+    expect(rec.called()).toBe(false);
   });
 
-  it("rejects IPv6 loopback literal", async () => {
+  it("rejects IPv6 loopback literal before dispatch (bracket stripping)", async () => {
+    // Regression: URL.hostname returns "[::1]" with brackets; ipaddr.parse
+    // rejects the bracketed form, so without bracket stripping this bypassed
+    // the gate entirely and reached dispatch.
+    const rec = recordingDispatcher();
     const result = await safeFetch("http://[::1]/", {
       timeoutMs: 2000,
       maxBytes: 1024,
-      dispatcher: mockDispatcher(),
+      dispatcher: rec.dispatcher,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe("blocked_destination");
     }
+    expect(rec.called()).toBe(false);
   });
 
-  it("rejects IPv4-mapped IPv6 loopback literal", async () => {
+  it("rejects IPv4-mapped IPv6 loopback literal before dispatch", async () => {
+    const rec = recordingDispatcher();
     const result = await safeFetch("http://[::ffff:127.0.0.1]/", {
       timeoutMs: 2000,
       maxBytes: 1024,
-      dispatcher: mockDispatcher(),
+      dispatcher: rec.dispatcher,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.code).toBe("blocked_destination");
     }
+    expect(rec.called()).toBe(false);
   });
 
   it("rejects a public URL that redirects to a private IP literal", async () => {
