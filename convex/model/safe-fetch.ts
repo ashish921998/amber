@@ -92,6 +92,42 @@ export function isPublicAddress(address: string): boolean {
   return parsed.range() === "unicast";
 }
 
+/**
+ * Validate the destination host of an already-parsed URL. IP-literal hosts
+ * (e.g. `http://127.0.0.1/`) are classified directly here because Node's
+ * net.connect does NOT call connect.lookup for IP literals — it connects
+ * straight to the address, which would bypass the validating DNS lookup.
+ * DNS-name hosts are left to the validating lookup at connection time.
+ *
+ * Throws SafeFetchErrorClass("blocked_destination") for a private/reserved
+ * IP-literal host. Throws nothing for DNS names (handled at connect time).
+ */
+function assertHostAllowed(url: string): void {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    throw new SafeFetchErrorClass("invalid_url" as SafeFetchError, "invalid host");
+  }
+  if (hostname === "") {
+    throw new SafeFetchErrorClass("blocked_destination", "missing host");
+  }
+  // Strip IPv6 brackets already handled by URL.hostname (it returns the bare
+  // address inside brackets-less). Try to parse as an IP literal.
+  let parsed: ipaddr.IPv4 | ipaddr.IPv6 | null = null;
+  try {
+    parsed = ipaddr.parse(hostname);
+  } catch {
+    // Not an IP literal — it's a DNS name; the validating lookup handles it.
+    return;
+  }
+  // It IS an IP literal: classify it. Reuse isPublicAddress so IPv4-mapped
+  // IPv6 and reserved ranges are handled identically to DNS answers.
+  if (!isPublicAddress(hostname)) {
+    throw new SafeFetchErrorClass("blocked_destination", "private ip literal");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // DNS resolver seam
 // ---------------------------------------------------------------------------
@@ -307,6 +343,11 @@ async function safeFetchThrowing(
   // credentials, port, host, and length. We keep the canonical string so every
   // subsequent hop is compared against a normalized form.
   let currentUrl = normalizeExternalUrl(rawUrl);
+  // IP-literal destinations are NOT routed through connect.lookup (Node's
+  // net.connect connects to IP literals directly), so validate them here and
+  // on every redirect. DNS hostnames are validated at connection time by the
+  // validating lookup. This closes the http://127.0.0.1/ SSRF path.
+  assertHostAllowed(currentUrl);
 
   // One total deadline covering DNS and all hops. Created before the loop so a
   // resolver that never completes still aborts.
@@ -346,6 +387,19 @@ async function safeFetchThrowing(
             );
           }
           throw new SafeFetchErrorClass("fetch_failed", "invalid redirect target");
+        }
+        // Re-check IP-literal destinations on the redirect target too (a public
+        // page can redirect to a private IP literal).
+        try {
+          assertHostAllowed(nextUrl);
+        } catch (e) {
+          if (isSafeFetchError(e)) {
+            throw e;
+          }
+          throw new SafeFetchErrorClass(
+            "blocked_destination",
+            "redirect target rejected",
+          );
         }
         redirects++;
         currentUrl = nextUrl;

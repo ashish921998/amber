@@ -361,6 +361,94 @@ describe("safeFetch HTTP policy", () => {
 });
 
 // ---------------------------------------------------------------------------
+// IP-literal SSRF: Node's net.connect does NOT call connect.lookup for IP
+// literals, so http://127.0.0.1/ would bypass the validating DNS lookup and
+// connect straight to loopback. assertHostAllowed classifies IP-literal hosts
+// before the request. These tests prove that gate (no dispatcher needed — the
+// block happens before any dispatch).
+// ---------------------------------------------------------------------------
+
+describe("safeFetch IP-literal SSRF block", () => {
+  it("rejects loopback IP literals", async () => {
+    const result = await safeFetch("http://127.0.0.1/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: mockDispatcher(),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("blocked_destination");
+    }
+  });
+
+  it("rejects RFC1918 private IP literals", async () => {
+    for (const ip of ["10.0.0.1", "172.16.0.1", "192.168.1.1"]) {
+      const result = await safeFetch(`http://${ip}/`, {
+        timeoutMs: 2000,
+        maxBytes: 1024,
+        dispatcher: mockDispatcher(),
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.code).toBe("blocked_destination");
+      }
+    }
+  });
+
+  it("rejects cloud-metadata link-local IP literal", async () => {
+    const result = await safeFetch("http://169.254.169.254/latest/meta-data/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: mockDispatcher(),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("blocked_destination");
+    }
+  });
+
+  it("rejects IPv6 loopback literal", async () => {
+    const result = await safeFetch("http://[::1]/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: mockDispatcher(),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("blocked_destination");
+    }
+  });
+
+  it("rejects IPv4-mapped IPv6 loopback literal", async () => {
+    const result = await safeFetch("http://[::ffff:127.0.0.1]/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: mockDispatcher(),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("blocked_destination");
+    }
+  });
+
+  it("rejects a public URL that redirects to a private IP literal", async () => {
+    const agent = mockDispatcher();
+    agent.get("http://a.test").intercept({ method: "GET", path: "/" }).reply(302, "", {
+      headers: { location: "http://169.254.169.254/" },
+    });
+    const result = await safeFetch("http://a.test/", {
+      timeoutMs: 2000,
+      maxBytes: 1024,
+      dispatcher: agent,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("blocked_destination");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Timeout: a dispatcher that never responds must still time out under the
 // single total deadline.
 // ---------------------------------------------------------------------------
