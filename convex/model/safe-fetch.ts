@@ -1,0 +1,468 @@
+/**
+ * Connection-bound safe HTTP fetcher for Convex Node actions.
+ *
+ * Defends against SSRF and resource exhaustion on every backend fetch of an
+ * external URL. The guarantees (see plan 007) are:
+ *
+ *   1. scheme/credential/port/length policy from external-url.ts, re-run on
+ *      every redirect target;
+ *   2. DNS answers resolved and classified with ipaddr.js — only globally
+ *      routable unicast addresses are allowed — and the validated address is
+ *      the one handed to the actual socket via undici's connect.lookup, so
+ *      validation cannot be bypassed by a second, independent resolution
+ *      (DNS rebinding);
+ *   3. manual redirects, at most MAX_REDIRECTS hops, each target revalidated
+ *      before the next request, each redirect body cancelled;
+ *   4. a single total deadline (AbortController) covering DNS and every hop —
+ *      a resolver that never completes still times out;
+ *   5. bounded streaming readers that honor Content-Length when present and
+ *      still stop after actual bytes exceed the limit, cancelling the body;
+ *   6. a narrow result type exposing only bounded bytes, the final validated
+ *      URL, status, and sanitized metadata — never the underlying Response
+ *      whose text()/json()/arrayBuffer() would bypass the limits;
+ *   7. errors/logs carry only a policy code and identifiers — never
+ *      credentials, query strings, redirect locations, response bodies, or
+ *      resolved addresses.
+ *
+ * This file imports undici (node:net/node:tls), so its tests MUST run under the
+ * vitest Node environment — NOT @vitest-environment edge-runtime.
+ */
+import { Agent, type Dispatcher } from "undici";
+import type BodyReadable from "undici/types/readable";
+import { lookup as dnsLookup } from "node:dns/promises";
+import type { LookupAddress } from "node:dns";
+import ipaddr from "ipaddr.js";
+import { normalizeExternalUrl, isUrlPolicyError, type UrlPolicyError } from "./external-url";
+
+// ---------------------------------------------------------------------------
+// Policy error type
+// ---------------------------------------------------------------------------
+
+export type SafeFetchError =
+  | UrlPolicyError
+  | "blocked_destination"
+  | "redirect_limit"
+  | "timeout"
+  | "unsupported_content_type"
+  | "response_too_large"
+  | "http_error"
+  | "fetch_failed";
+
+export class SafeFetchErrorClass extends Error {
+  constructor(
+    public readonly code: SafeFetchError,
+    message: string,
+  ) {
+    super(message);
+    this.name = "SafeFetchError";
+  }
+}
+
+export function isSafeFetchError(e: unknown): e is SafeFetchErrorClass {
+  return e instanceof SafeFetchErrorClass;
+}
+
+// ---------------------------------------------------------------------------
+// Address classification
+// ---------------------------------------------------------------------------
+
+/**
+ * ipaddr.js `range()` returns the broad class of an address. We allow only
+ * `unicast` — globally routable addresses — and reject everything else:
+ * loopback, private (RFC1918), linkLocal, multicast, reserved, and
+ * documentation/test ranges. IPv4-mapped IPv6 addresses are parsed by
+ * ipaddr.js and their mapped IPv4 is classified, so ::ffff:127.0.0.1 is
+ * correctly rejected as loopback.
+ */
+export function isPublicAddress(address: string): boolean {
+  let parsed: ipaddr.IPv4 | ipaddr.IPv6;
+  try {
+    parsed = ipaddr.parse(address);
+  } catch {
+    return false;
+  }
+  // Normalize IPv4-mapped IPv6 to classify the embedded IPv4.
+  if (parsed.kind() === "ipv6") {
+    const v6 = parsed as ipaddr.IPv6;
+    if (v6.isIPv4MappedAddress()) {
+      const mapped = v6.toIPv4Address();
+      return mapped.range() === "unicast";
+    }
+  }
+  return parsed.range() === "unicast";
+}
+
+// ---------------------------------------------------------------------------
+// DNS resolver seam
+// ---------------------------------------------------------------------------
+
+/** A hostname -> addresses resolver. Injected for tests; production uses
+ * node:dns/promises lookup with verbatim:true. */
+export type DnsResolver = (
+  hostname: string,
+) => Promise<readonly LookupAddress[]>;
+
+/** Production resolver: all addresses, verbatim (no OS reordering). */
+export const defaultResolver: DnsResolver = async (hostname) => {
+  // verbatim:true asks the resolver to return addresses in the order the
+  // underlying getaddrinfo produced them, without the OS shuffling them. We
+  // validate every answer, so ordering does not change the verdict, but
+  // verbatim keeps behavior deterministic.
+  return dnsLookup(hostname, { all: true, verbatim: true });
+};
+
+/**
+ * Build the validating undici `lookup` for a single connection. It resolves the
+ * hostname, checks EVERY answer (a single private answer in a mixed set fails
+ * the whole request), and returns only the chosen public address to the socket.
+ * Returning a single validated address to net/tls.connect is what binds the
+ * check to the connection actually used.
+ */
+export function makeValidatingLookup(resolver: DnsResolver) {
+  return async (
+    hostname: string,
+    _options: unknown,
+    callback: (
+      err: NodeJS.ErrnoException | null,
+      address: string,
+      family: number,
+    ) => void,
+  ): Promise<void> => {
+    let addresses: readonly LookupAddress[];
+    try {
+      addresses = await resolver(hostname);
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      callback(err, "", 4);
+      return;
+    }
+    if (addresses.length === 0) {
+      callback(
+        Object.assign(new Error("no DNS answers"), { code: "ENOTFOUND" }) as NodeJS.ErrnoException,
+        "",
+        4,
+      );
+      return;
+    }
+    // Reject if ANY answer is unsafe — do not pick a convenient public one from
+    // a mixed set. This defeats DNS rebinding that returns a public + private.
+    for (const a of addresses) {
+      if (!isPublicAddress(a.address)) {
+        const err = Object.assign(
+          new Error("blocked private destination"),
+          { code: "ECONNREFUSED" },
+        ) as NodeJS.ErrnoException;
+        callback(err, "", 4);
+        return;
+      }
+    }
+    // All answers are public; hand the first to the socket. The others having
+    // already passed validation means rebinding to them later is still safe.
+    const chosen = addresses[0];
+    callback(null, chosen.address, chosen.family);
+  };
+}
+
+/** Build a production undici Agent whose connections use the validating lookup. */
+export function makeSafeDispatcher(resolver: DnsResolver = defaultResolver): Dispatcher {
+  // undici forwards connect options to net.connect/tls.connect, so `lookup`
+  // here is the resolver used when establishing the socket.
+  return new Agent({
+    connect: { lookup: makeValidatingLookup(resolver) as never },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Result type (narrow — never exposes the raw Response)
+// ---------------------------------------------------------------------------
+
+export type SafeFetchOk = {
+  ok: true;
+  /** Final, policy-validated URL after following redirects. Safe to log:
+   * credentials are rejected at parse time; query strings may be present, so
+   * callers that carry secrets in the query must use redactUrlForLog. */
+  finalUrl: string;
+  status: number;
+  contentType: string;
+  /** Bounded body bytes. Never larger than the requested maxBytes. */
+  bytes: Uint8Array;
+};
+
+export type SafeFetchResult =
+  | SafeFetchOk
+  | { ok: false; code: SafeFetchError };
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+export type SafeFetchOptions = {
+  /** Total deadline in ms, covering DNS resolution and every redirect hop. */
+  timeoutMs: number;
+  /** Hard cap on streamed body bytes, enforced even if Content-Length is absent
+   * or the server ignores Range. */
+  maxBytes: number;
+  /** Content-type allow predicate. Defaults to allowing any. */
+  allowContentType?: (contentType: string) => boolean;
+  /** Optional extra headers (e.g. Range, User-Agent). Must not carry secrets. */
+  headers?: Record<string, string>;
+  /** Maximum redirects AFTER the initial request. */
+  maxRedirects?: number;
+  /** Injected for tests. Production omits and uses a validating undici Agent. */
+  dispatcher?: Dispatcher;
+  /** Injected clock for tests. */
+  now?: () => number;
+};
+
+const DEFAULT_MAX_REDIRECTS = 3;
+
+// ---------------------------------------------------------------------------
+// URL redaction for logs
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip the query string (which may carry secrets like the SerpAPI key) from a
+ * URL for safe logging. Keeps scheme + host + path. Never throws.
+ */
+export function redactUrlForLog(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.search = "";
+    return parsed.toString();
+  } catch {
+    return "<invalid url>";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded reader
+// ---------------------------------------------------------------------------
+
+/** Read at most `maxBytes` from an undici response body, enforcing the cap
+ * even when Content-Length is missing or lied about. Returns the bounded bytes
+ * or throws SafeFetchErrorClass(response_too_large) if the limit is exceeded. */
+async function readBounded(
+  body: BodyReadable,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of body as unknown as AsyncIterable<Buffer>) {
+    if (signal.aborted) {
+      throw new SafeFetchErrorClass("timeout", "deadline exceeded while reading body");
+    }
+    total += chunk.length;
+    if (total > maxBytes) {
+      // Over cap: cancel the body by dumping the remainder.
+      await safeDump(body);
+      throw new SafeFetchErrorClass("response_too_large", "body exceeded max bytes");
+    }
+    chunks.push(chunk);
+  }
+  return new Uint8Array(Buffer.concat(chunks));
+}
+
+// ---------------------------------------------------------------------------
+// Core fetch
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch an external URL with the full safe-fetch policy. Resolves to a narrow
+ * result; never throws SafeFetchErrorClass (errors are encoded in the result).
+ * Internal helper `safeFetchThrowing` throws for call sites that prefer try/catch.
+ */
+export async function safeFetch(
+  rawUrl: string,
+  options: SafeFetchOptions,
+): Promise<SafeFetchResult> {
+  return safeFetchThrowing(rawUrl, options).then(
+    (value) => ({ ok: true, ...value }) as SafeFetchOk,
+    (e: unknown) => {
+      if (isSafeFetchError(e)) {
+        return { ok: false, code: e.code };
+      }
+      if (isUrlPolicyError(e)) {
+        return { ok: false, code: e.code };
+      }
+      return { ok: false, code: "fetch_failed" as SafeFetchError };
+    },
+  );
+}
+
+async function safeFetchThrowing(
+  rawUrl: string,
+  options: SafeFetchOptions,
+): Promise<Omit<SafeFetchOk, "ok">> {
+  const {
+    timeoutMs,
+    maxBytes,
+    allowContentType = () => true,
+    headers = {},
+    maxRedirects = DEFAULT_MAX_REDIRECTS,
+    dispatcher = makeSafeDispatcher(),
+  } = options;
+
+  // Re-validate the URL syntactically on entry. external-url enforces scheme,
+  // credentials, port, host, and length. We keep the canonical string so every
+  // subsequent hop is compared against a normalized form.
+  let currentUrl = normalizeExternalUrl(rawUrl);
+
+  // One total deadline covering DNS and all hops. Created before the loop so a
+  // resolver that never completes still aborts.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+
+  try {
+    let redirects = 0;
+    // The first request counts as the initial; up to maxRedirects may follow.
+    for (let hop = 0; ; hop++) {
+      if (ac.signal.aborted) {
+        throw new SafeFetchErrorClass("timeout", "deadline exceeded");
+      }
+      const response = await dispatch(dispatcher, currentUrl, headers, ac.signal);
+      // The response body must always be consumed or cancelled. We either
+      // follow a redirect (cancel body, continue), error (cancel body, throw),
+      // or return (read bounded body).
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        await safeDump(response.body);
+        if (redirects >= maxRedirects) {
+          throw new SafeFetchErrorClass("redirect_limit", "too many redirects");
+        }
+        const location = response.headers["location"];
+        if (typeof location !== "string" || location === "") {
+          throw new SafeFetchErrorClass("fetch_failed", "redirect without Location");
+        }
+        // Resolve relative Location against the current URL, then re-run full
+        // URL policy (scheme, credentials, port, length).
+        let nextUrl: string;
+        try {
+          nextUrl = normalizeExternalUrl(new URL(location, currentUrl).toString());
+        } catch (e) {
+          if (isUrlPolicyError(e)) {
+            throw new SafeFetchErrorClass(
+              e.code,
+              "redirect target rejected by url policy",
+            );
+          }
+          throw new SafeFetchErrorClass("fetch_failed", "invalid redirect target");
+        }
+        redirects++;
+        currentUrl = nextUrl;
+        continue;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        await safeDump(response.body);
+        throw new SafeFetchErrorClass(
+          "http_error",
+          `http status ${response.statusCode}`,
+        );
+      }
+      const contentType = String(response.headers["content-type"] ?? "");
+      if (!allowContentType(contentType)) {
+        await safeDump(response.body);
+        throw new SafeFetchErrorClass(
+          "unsupported_content_type",
+          "content type not allowed",
+        );
+      }
+      // Pre-check a declared Content-Length against the cap before streaming.
+      const declared = response.headers["content-length"];
+      if (typeof declared === "string") {
+        const len = Number(declared);
+        if (Number.isFinite(len) && len > maxBytes) {
+          await safeDump(response.body);
+          throw new SafeFetchErrorClass("response_too_large", "content-length over cap");
+        }
+      }
+      const bytes = await readBounded(response.body, maxBytes, ac.signal);
+      return {
+        finalUrl: currentUrl,
+        status: response.statusCode,
+        contentType,
+        bytes,
+      };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Issue a single GET request through the dispatcher. undici's request() uses
+ * the dispatcher's connect.lookup (our validating resolver) for DNS. We race
+ * the request against an explicit abort listener so the total deadline fires
+ * even if a dispatcher ignores the signal. */
+async function dispatch(
+  dispatcher: Dispatcher,
+  url: string,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+): Promise<Dispatcher.ResponseData> {
+  const parsed = new URL(url);
+  // Abort races the request. If the deadline fires first, reject with timeout.
+  const abortRace = new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(new SafeFetchErrorClass("timeout", "deadline exceeded"));
+      return;
+    }
+    signal.addEventListener(
+      "abort",
+      () => reject(new SafeFetchErrorClass("timeout", "deadline exceeded")),
+      { once: true },
+    );
+  });
+  try {
+    return await Promise.race([
+      dispatcher.request({
+        method: "GET",
+        origin: parsed.origin,
+        path: parsed.pathname + parsed.search,
+        headers,
+        signal,
+      }),
+      abortRace,
+    ]);
+  } catch (e) {
+    // Translate a raw transport error into a safe-fetch error. We must not
+    // leak the URL (it may carry a query secret) — only a code propagates.
+    if (e instanceof SafeFetchErrorClass) {
+      throw e;
+    }
+    const err = e as NodeJS.ErrnoException;
+    if (signal.aborted) {
+      throw new SafeFetchErrorClass("timeout", "deadline exceeded");
+    }
+    if (err !== null && typeof err === "object" && "code" in err) {
+      // ECONNREFUSED is how our validating lookup blocks a private destination.
+      throw new SafeFetchErrorClass("blocked_destination", "request failed");
+    }
+    throw new SafeFetchErrorClass("fetch_failed", "request failed");
+  }
+}
+
+/** Best-effort dump of a response body so the connection is released. */
+async function safeDump(body: BodyReadable | null | undefined): Promise<void> {
+  if (body === null || body === undefined) {
+    return;
+  }
+  try {
+    await body.dump();
+  } catch {
+    // Cancellation is best-effort.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience readers (operate on the already-bounded bytes)
+// ---------------------------------------------------------------------------
+
+/** Decode bounded bytes as text using UTF-8. The stream cap already bounded
+ * the size; this just converts. Callers should still slice for their needs. */
+export function decodeUtf8(bytes: Uint8Array): string {
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+/** Parse bounded bytes as JSON. Throws on invalid JSON. */
+export function parseJson(bytes: Uint8Array): unknown {
+  return JSON.parse(decodeUtf8(bytes));
+}
