@@ -144,13 +144,41 @@ export type DnsResolver = (
   hostname: string,
 ) => Promise<readonly LookupAddress[]>;
 
-/** Production resolver: all addresses, verbatim (no OS reordering). */
+/**
+ * Hard ceiling on a single DNS resolution. Node's dns.lookup has no built-in
+ * timeout — it relies on the OS getaddrinfo, which can hang for tens of seconds
+ * against a non-responsive resolver. undici does not wire the request AbortSignal
+ * to the lookup phase, so a hung lookup would outlive the per-request deadline
+ * returned to the caller, dangling a connection attempt. This bound fails the
+ * lookup fast (well under every caller's timeoutMs) so no DNS work lingers.
+ */
+export const DNS_LOOKUP_TIMEOUT_MS = 8000;
+
+/** Race a promise against a timeout, rejecting with a coded error on expiry. */
+function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(Object.assign(new Error("dns lookup timed out"), { code })),
+      ms,
+    );
+  });
+  return Promise.race([promise, expiry]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/** Production resolver: all addresses, verbatim (no OS reordering), bounded by
+ * {@link DNS_LOOKUP_TIMEOUT_MS} so a hung getaddrinfo cannot outlive the request. */
 export const defaultResolver: DnsResolver = async (hostname) => {
   // verbatim:true asks the resolver to return addresses in the order the
   // underlying getaddrinfo produced them, without the OS shuffling them. We
   // validate every answer, so ordering does not change the verdict, but
   // verbatim keeps behavior deterministic.
-  return dnsLookup(hostname, { all: true, verbatim: true });
+  const lookup = dnsLookup(hostname, { all: true, verbatim: true });
+  // A hung lookup surfaces as a resolver error, which makeValidatingLookup
+  // forwards to the socket as EAI_AGAIN-ish; the request then fails fast.
+  return withTimeout(lookup, DNS_LOOKUP_TIMEOUT_MS, "ETIMEDOUT");
 };
 
 /**
@@ -515,14 +543,16 @@ async function dispatch(
       throw e;
     }
     const err = e as NodeJS.ErrnoException;
-    if (signal.aborted) {
-      throw new SafeFetchErrorClass("timeout", "deadline exceeded");
-    }
     // The validating lookup blocks a private destination with ECONNREFUSED.
     // Map only that marker to blocked_destination so a genuine network failure
     // (ECONNRESET, EHOSTUNREACH, etc.) is reported as fetch_failed instead.
+    // Check this before signal.aborted: under a near-simultaneous block + abort,
+    // a genuinely blocked destination should be reported as such, not as timeout.
     if (err !== null && typeof err === "object" && err.code === "ECONNREFUSED") {
       throw new SafeFetchErrorClass("blocked_destination", "request failed");
+    }
+    if (signal.aborted) {
+      throw new SafeFetchErrorClass("timeout", "deadline exceeded");
     }
     throw new SafeFetchErrorClass("fetch_failed", "request failed");
   }

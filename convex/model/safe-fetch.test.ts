@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  defaultResolver,
   isPublicAddress,
   makeValidatingLookup,
   redactUrlForLog,
@@ -184,6 +185,22 @@ describe("makeValidatingLookup (connection-bound DNS)", () => {
     expect(err?.code).toBe("ECONNREFUSED");
     // On error the lookup returns no address array (the second arg is unused).
     expect(Array.isArray(addresses)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DNS lookup deadline: defaultResolver must fail fast when getaddrinfo hangs,
+// so no DNS work outlives the request (undici does not wire the AbortSignal to
+// the lookup phase). We can't easily hang the real getaddrinfo, so assert the
+// resolver rejects promptly for an already-failing lookup with the coded error.
+// ---------------------------------------------------------------------------
+
+describe("defaultResolver deadline", () => {
+  it("rejects (does not hang) when the underlying lookup fails", async () => {
+    // A domain that will not resolve -> getaddrinfo fails fast rather than
+    // hanging. The point is that the resolver surfaces a rejection (coded),
+    // which makeValidatingLookup forwards, instead of lingering indefinitely.
+    await expect(defaultResolver("nonexistent.invalid.local.test")).rejects.toThrow();
   });
 });
 
