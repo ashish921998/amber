@@ -419,3 +419,51 @@ describe("redactUrlForLog", () => {
     expect(redactUrlForLog("not a url")).toBe("<invalid url>");
   });
 });
+
+describe("secret leakage", () => {
+  it("never includes a query-string API key in a blocked-fetch result code", async () => {
+    // A SerpAPI-style URL carries the key in the query. When the fetch is
+    // blocked (here by an unreachable host via a hanging dispatcher), the
+    // result must encode only a policy code and never the secret.
+    const SECRET = "AKIAFAKEKEY1234567890";
+    const url = `https://serpapi.com/search?q=test&api_key=${SECRET}`;
+    const hangingDispatcher: Dispatcher = {
+      request() {
+        return new Promise(() => {
+          /* never resolves */
+        });
+      },
+    } as unknown as Dispatcher;
+    const result = await safeFetch(url, {
+      timeoutMs: 200,
+      maxBytes: 1024,
+      dispatcher: hangingDispatcher,
+    });
+    expect(result.ok).toBe(false);
+    // The entire result object must be free of the secret.
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+    if (!result.ok) {
+      expect(result.code).toBe("timeout");
+    }
+  });
+
+  it("never includes a query-string secret in a content-type rejection", async () => {
+    const SECRET = "SUPERSECRETKEY";
+    const agent = mockDispatcher();
+    agent
+      .get("https://serpapi.test")
+      .intercept({ method: "GET", path: "/search" })
+      .reply(200, "x", { headers: { "content-type": "text/plain" } });
+    const result = await safeFetch(
+      `https://serpapi.test/search?api_key=${SECRET}`,
+      {
+        timeoutMs: 2000,
+        maxBytes: 1024,
+        dispatcher: agent,
+        allowContentType: (ct) => ct.includes("json"),
+      },
+    );
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+    expect(result.ok).toBe(false);
+  });
+});
