@@ -926,12 +926,15 @@ describe("shared link/note operation idempotency", () => {
 
   it("rejects an invalid url on the idempotent path without completing the op", async () => {
     const t = as("user-a");
+    // The centralized URL policy rejects empty/whitespace URLs before any
+    // operation row is created. The error category is "empty"; the important
+    // contract is that the op is not recorded, so a corrected retry is clean.
     await expect(
       t.mutation(api.items.createLinkItem, {
         url: "  ",
         operationId: LINK_OP,
       }),
-    ).rejects.toThrow(/Invalid URL/i);
+    ).rejects.toThrow(/empty/i);
     const op = await t.query(api.items.getImportOperation, {
       operationId: LINK_OP,
     });
