@@ -8,6 +8,13 @@ import { generateObject } from "ai";
 import { z } from "zod";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
+import {
+  safeFetch,
+  decodeUtf8,
+  parseJson,
+  isSafeFetchError,
+  type SafeFetchError,
+} from "./model/safe-fetch";
 
 // Bare model-id strings route through the Vercel AI Gateway automatically
 // (authenticated via the AI_GATEWAY_API_KEY deployment env var).
@@ -191,30 +198,36 @@ function readImageSize(
   return undefined;
 }
 
-/** Fetch just enough of an image to read its real width/height ratio. */
+/**
+ * Fetch just enough of a metadata image to read its real width/height ratio.
+ * Best-effort: any policy/transport failure returns no ratio and the caller
+ * falls back to a sensible default. Routes through the safe fetcher so the
+ * destination is policy-checked and the body is hard-capped at 128 KiB even if
+ * the server ignores Range.
+ */
 async function fetchImageAspectRatio(
   imageUrl: string,
 ): Promise<number | undefined> {
-  try {
-    const response = await fetch(imageUrl, {
-      redirect: "follow",
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        // Header bytes live at the front; 128KB covers even large EXIF blocks.
-        Range: "bytes=0-131071",
-      },
-    });
-    if (!response.ok && response.status !== 206) {
-      return undefined;
-    }
-    const size = readImageSize(new Uint8Array(await response.arrayBuffer()));
-    if (size && size.width > 0 && size.height > 0) {
-      return size.width / size.height;
-    }
-  } catch {
-    // Best-effort — a missing ratio just falls back to a sensible default.
+  const result = await safeFetch(imageUrl, {
+    timeoutMs: 10000,
+    // Header bytes live at the front; 128 KiB covers large EXIF blocks. The
+    // safe fetcher enforces this cap on actual streamed bytes regardless of
+    // what the server sends, so a Range-ignoring server still cannot exhaust us.
+    maxBytes: 131072,
+    allowContentType: (ct) => ct.startsWith("image/"),
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      Range: "bytes=0-131071",
+    },
+  });
+  if (!result.ok) {
+    // A blocked or oversized hero image is best-effort — no aspect ratio.
+    return undefined;
+  }
+  const size = readImageSize(result.bytes);
+  if (size && size.width > 0 && size.height > 0) {
+    return size.width / size.height;
   }
   return undefined;
 }
@@ -346,10 +359,51 @@ type PageData = {
   content?: string;
 };
 
+/**
+ * Thrown when the page fetch is blocked by the safe-fetch policy. Carries only
+ * a stable code (never the URL, addresses, or response body) so callers can log
+ * a sanitized category. A blocked primary page fetch is a CORE processing
+ * failure, unlike a blocked best-effort hero image.
+ */
+export class PageFetchBlockedError extends Error {
+  constructor(public readonly code: SafeFetchError) {
+    super(`page fetch blocked: ${code}`);
+    this.name = "PageFetchBlockedError";
+  }
+}
+
+export function isPageFetchBlockedError(
+  e: unknown,
+): e is PageFetchBlockedError {
+  return e instanceof PageFetchBlockedError;
+}
+
+/**
+ * Reduce a caught error to a safe log category. Fetch-policy errors expose only
+ * their stable code; anything else is a generic "unexpected_error". Never
+ * returns the error's message or cause, which may carry a URL, response body,
+ * or resolved address. Used by the action catch handlers.
+ */
+function summarizeError(error: unknown): string {
+  if (isPageFetchBlockedError(error)) {
+    return `page_fetch_blocked:${error.code}`;
+  }
+  if (isSafeFetchError(error)) {
+    return `safe_fetch:${error.code}`;
+  }
+  return "unexpected_error";
+}
+
 async function fetchPage(url: string): Promise<PageData> {
-  const response = await fetch(url, {
-    redirect: "follow",
-    signal: AbortSignal.timeout(15000),
+  const result = await safeFetch(url, {
+    timeoutMs: 15000,
+    // Hard cap on the streamed page body. Generous for real articles; bounded
+    // to deny a malicious/buggy server from exhausting memory.
+    maxBytes: 1024 * 1024,
+    allowContentType: (ct) =>
+      ct.startsWith("text/html") ||
+      ct.startsWith("application/xhtml+xml") ||
+      ct.startsWith("application/xml"),
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -358,11 +412,13 @@ async function fetchPage(url: string): Promise<PageData> {
       "Accept-Language": "en-US,en;q=0.9",
     },
   });
-  if (!response.ok) {
-    throw new Error(`Fetch failed with status ${response.status}`);
+  if (!result.ok) {
+    // A blocked/oversized/timed-out page fetch fails this item's processing.
+    // Surface only the policy code; the catch handlers log a sanitized category.
+    throw new PageFetchBlockedError(result.code);
   }
-  const finalUrl = response.url || url;
-  const html = await response.text();
+  const finalUrl = result.finalUrl;
+  const html = decodeUtf8(result.bytes);
 
   const title = extractTitle(html);
   const description =
@@ -667,7 +723,15 @@ export const processItem = internalAction({
         });
       }
     } catch (error) {
-      console.error(`processItem failed for ${args.itemId}:`, error);
+      // Sanitized error log. For fetch-policy failures (PageFetchBlockedError,
+      // SafeFetchError) log only the stable policy code + item id — never the
+      // error object, its cause, URLs, headers, response bodies, or resolved
+      // addresses. For other errors log a generic category so a thrown Error's
+      // message (which may include a URL) is not leaked either.
+      console.error(
+        `processItem failed for ${args.itemId}:`,
+        summarizeError(error),
+      );
       await ctx.runMutation(internal.items.failItem, { itemId: args.itemId });
     }
     return null;
@@ -788,7 +852,11 @@ export const recommendForSpace = internalAction({
         });
       }
     } catch (error) {
-      console.error(`recommendForSpace failed for ${args.spaceId}:`, error);
+      // Sanitized: log a category, not the raw error object.
+      console.error(
+        `recommendForSpace failed for ${args.spaceId}:`,
+        summarizeError(error),
+      );
     }
     return null;
   },
@@ -937,14 +1005,29 @@ export const findProductLinks = internalAction({
         return null;
       }
 
-      const response = await fetch(
-        `https://serpapi.com/search.json?engine=google_shopping&gl=us&hl=en&q=${encodeURIComponent(query)}&api_key=${apiKey}`,
-        { signal: AbortSignal.timeout(20000) },
-      );
-      if (!response.ok) {
-        throw new Error(`SerpAPI responded ${response.status}`);
+      // Build the fixed SerpAPI request URL. The destination is not
+      // user-controlled, but the response is still bounded: JSON content type
+      // required, 1 MiB stream cap before parse, 20s deadline, and the same
+      // public-address/redirect policy. The API key lives in the query string,
+      // so the safe fetcher must never log the URL (it logs only codes), and we
+      // redact explicitly below.
+      const serpApiUrl = `https://serpapi.com/search.json?engine=google_shopping&gl=us&hl=en&q=${encodeURIComponent(query)}&api_key=${apiKey}`;
+      const result = await safeFetch(serpApiUrl, {
+        timeoutMs: 20000,
+        maxBytes: 1024 * 1024,
+        allowContentType: (ct) =>
+          ct.startsWith("application/json") || ct.includes("json"),
+      });
+      if (!result.ok) {
+        // Log only the policy code — never the URL (it carries the API key),
+        // never a response body or resolved address.
+        console.error(
+          `findProductLinks: serpapi fetch blocked (${result.code}) for ${args.itemId}`,
+        );
+        await fail();
+        return null;
       }
-      const products = parseShoppingResults(await response.json());
+      const products = parseShoppingResults(parseJson(result.bytes));
 
       await ctx.runMutation(internal.items.setProductsInternal, {
         itemId: args.itemId,
@@ -952,7 +1035,15 @@ export const findProductLinks = internalAction({
         productsStatus: "ready",
       });
     } catch (error) {
-      console.error(`findProductLinks failed for ${args.itemId}:`, error);
+      // Sanitized error log: never the raw error object (which may carry the
+      // request URL with the API key, or a response body). Log only a category
+      // and the item id.
+      console.error(
+        `findProductLinks failed for ${args.itemId}:`,
+        isSafeFetchError(error) || isPageFetchBlockedError(error)
+          ? (error as { code?: string }).code
+          : "unexpected_error",
+      );
       await fail();
     }
     return null;
@@ -1019,9 +1110,10 @@ export const steerItemForSpace = internalAction({
         });
       }
     } catch (error) {
+      // Sanitized: log a category, not the raw error object.
       console.error(
         `steerItemForSpace failed for ${args.itemId} in ${args.spaceId}:`,
-        error,
+        summarizeError(error),
       );
     }
     return null;
