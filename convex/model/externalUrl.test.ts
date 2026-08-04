@@ -4,8 +4,7 @@ import {
   isUrlPolicyError,
   MAX_URL_LENGTH,
   normalizeExternalUrl,
-  normalizeExternalUrlResult,
-} from "./external-url";
+} from "./externalUrl";
 
 /** Assert the policy code thrown by normalizeExternalUrl for a given input. */
 function expectCode(raw: string, code: string): void {
@@ -145,22 +144,5 @@ describe("normalizeExternalUrl - empty / invalid", () => {
     expectCode("https://exa mple.com", "invalid_host");
     // Genuinely unparseable schemeless garbage is invalid_url.
     expectCode("exa mple", "invalid_url");
-  });
-});
-
-describe("normalizeExternalUrlResult", () => {
-  it("returns ok with the canonical url on success", () => {
-    const r = normalizeExternalUrlResult("example.com");
-    expect(r).toEqual({ ok: true, url: "https://example.com/" });
-  });
-  it("returns the policy code on failure", () => {
-    expect(normalizeExternalUrlResult("javascript:alert(1)")).toEqual({
-      ok: false,
-      code: "unsupported_scheme",
-    });
-    expect(normalizeExternalUrlResult("https://user@host")).toEqual({
-      ok: false,
-      code: "credentials_not_allowed",
-    });
   });
 });

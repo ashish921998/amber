@@ -4,7 +4,7 @@
  * Defends against SSRF and resource exhaustion on every backend fetch of an
  * external URL. The guarantees (see plan 007) are:
  *
- *   1. scheme/credential/port/length policy from external-url.ts, re-run on
+ *   1. scheme/credential/port/length policy from externalUrl.ts, re-run on
  *      every redirect target;
  *   2. DNS answers resolved and classified with ipaddr.js — only globally
  *      routable unicast addresses are allowed — and the validated address is
@@ -27,12 +27,14 @@
  * This file imports undici (node:net/node:tls), so its tests MUST run under the
  * vitest Node environment — NOT @vitest-environment edge-runtime.
  */
+"use node";
+
 import { Agent, type Dispatcher } from "undici";
 import type BodyReadable from "undici/types/readable";
 import { lookup as dnsLookup } from "node:dns/promises";
 import type { LookupAddress } from "node:dns";
 import ipaddr from "ipaddr.js";
-import { normalizeExternalUrl, isUrlPolicyError, type UrlPolicyError } from "./external-url";
+import { normalizeExternalUrl, isUrlPolicyError, type UrlPolicyError } from "./externalUrl";
 
 // ---------------------------------------------------------------------------
 // Policy error type
@@ -107,7 +109,7 @@ function assertHostAllowed(url: string): void {
   try {
     hostname = new URL(url).hostname;
   } catch {
-    throw new SafeFetchErrorClass("invalid_url" as SafeFetchError, "invalid host");
+    throw new SafeFetchErrorClass("invalid_url", "invalid host");
   }
   if (hostname === "") {
     throw new SafeFetchErrorClass("blocked_destination", "missing host");
@@ -276,7 +278,7 @@ export type SafeFetchOk = {
   ok: true;
   /** Final, policy-validated URL after following redirects. Safe to log:
    * credentials are rejected at parse time; query strings may be present, so
-   * callers that carry secrets in the query must use redactUrlForLog. */
+   * callers that carry secrets in the query must redact before logging. */
   finalUrl: string;
   status: number;
   contentType: string;
@@ -311,24 +313,6 @@ export type SafeFetchOptions = {
 };
 
 const DEFAULT_MAX_REDIRECTS = 3;
-
-// ---------------------------------------------------------------------------
-// URL redaction for logs
-// ---------------------------------------------------------------------------
-
-/**
- * Strip the query string (which may carry secrets like the SerpAPI key) from a
- * URL for safe logging. Keeps scheme + host + path. Never throws.
- */
-export function redactUrlForLog(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.search = "";
-    return parsed.toString();
-  } catch {
-    return "<invalid url>";
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Bounded reader
@@ -366,7 +350,8 @@ async function readBounded(
 /**
  * Fetch an external URL with the full safe-fetch policy. Resolves to a narrow
  * result; never throws SafeFetchErrorClass (errors are encoded in the result).
- * Internal helper `safeFetchThrowing` throws for call sites that prefer try/catch.
+ * Internal helper `safeFetchThrowing` uses throwing for natural control flow;
+ * the public `safeFetch` wrapper catches and converts to the result type.
  */
 export async function safeFetch(
   rawUrl: string,
@@ -381,7 +366,7 @@ export async function safeFetch(
       if (isUrlPolicyError(e)) {
         return { ok: false, code: e.code };
       }
-      return { ok: false, code: "fetch_failed" as SafeFetchError };
+      return { ok: false, code: "fetch_failed" };
     },
   );
 }
@@ -417,7 +402,7 @@ async function safeFetchThrowing(
   try {
     let redirects = 0;
     // The first request counts as the initial; up to maxRedirects may follow.
-    for (let hop = 0; ; hop++) {
+    for (;;) {
       if (ac.signal.aborted) {
         throw new SafeFetchErrorClass("timeout", "deadline exceeded");
       }

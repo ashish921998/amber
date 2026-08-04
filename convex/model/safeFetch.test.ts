@@ -1,4 +1,4 @@
-// Node environment by default (no edge-runtime pragma). safe-fetch imports
+// Node environment by default (no edge-runtime pragma). safeFetch imports
 // undici (node:net/node:tls) which will not load under @edge-runtime/vm.
 import { describe, expect, it } from "vitest";
 
@@ -6,10 +6,9 @@ import {
   defaultResolver,
   isPublicAddress,
   makeValidatingLookup,
-  redactUrlForLog,
   safeFetch,
-} from "./safe-fetch";
-import type { DnsResolver } from "./safe-fetch";
+} from "./safeFetch";
+import type { DnsResolver } from "./safeFetch";
 import { MockAgent, type Dispatcher } from "undici";
 
 // ---------------------------------------------------------------------------
@@ -592,24 +591,9 @@ describe("safeFetch timeout", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Redaction
+// Secret leakage: a blocked or rejected fetch must never include query-string
+// secrets (e.g. the SerpAPI key) in its result.
 // ---------------------------------------------------------------------------
-
-describe("redactUrlForLog", () => {
-  it("strips the query string (which may carry secrets)", () => {
-    expect(redactUrlForLog("https://serpapi.com/search?q=x&api_key=SECRET")).toBe(
-      "https://serpapi.com/search",
-    );
-  });
-  it("keeps scheme, host, path, and fragment", () => {
-    expect(redactUrlForLog("https://example.com/a/b?x=1#frag")).toBe(
-      "https://example.com/a/b#frag",
-    );
-  });
-  it("returns a placeholder for unparseable input", () => {
-    expect(redactUrlForLog("not a url")).toBe("<invalid url>");
-  });
-});
 
 describe("secret leakage", () => {
   it("never includes a query-string API key in a blocked-fetch result code", async () => {

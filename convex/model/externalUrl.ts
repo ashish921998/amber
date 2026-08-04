@@ -5,10 +5,10 @@
  * used from Convex mutations (default V8 runtime) and from Node actions alike.
  * It validates only the *form* of a URL — scheme, host, port, credentials,
  * length. It does NOT resolve DNS or inspect the destination address; that is
- * the job of `safe-fetch.ts` at request time, bound to the actual connection.
+ * the job of `safeFetch.ts` at request time, bound to the actual connection.
  *
  * Network destination safety (private/reserved IP ranges, DNS answers) lives in
- * `safe-fetch.ts` because it requires Node-only libraries.
+ * `safeFetch.ts` because it requires Node-only libraries.
  */
 
 /** Policy error categories. Stable codes used by callers and logs; never the
@@ -128,20 +128,4 @@ export function normalizeExternalUrl(raw: string): string {
   return canonical;
 }
 
-/**
- * Normalize without throwing. Returns the canonical URL or a policy error code.
- * Convenient at boundaries that prefer a result over try/catch.
- */
-export function normalizeExternalUrlResult(
-  raw: string,
-): { ok: true; url: string } | { ok: false; code: UrlPolicyError } {
-  try {
-    const url = normalizeExternalUrl(raw);
-    return { ok: true, url };
-  } catch (e) {
-    if (isUrlPolicyError(e)) {
-      return { ok: false, code: e.code };
-    }
-    return { ok: false, code: "invalid_url" };
-  }
-}
+

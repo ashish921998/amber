@@ -10,7 +10,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { requireUserId } from "./model/auth";
 import { effectiveStatus } from "./model/memberships";
-import { normalizeExternalUrl } from "./model/external-url";
+import { normalizeExternalUrl } from "./model/externalUrl";
 
 /** Practical per-query cap so a very large library can't blow the read limit. */
 const LIST_CAP = 1000;
@@ -898,7 +898,7 @@ export const createLinkItem = mutation({
     // credentials, non-default ports, missing hosts, and oversized URLs before
     // the item is ever inserted or scheduled. Network-destination safety (private
     // IP ranges, DNS answers) is enforced later, bound to the actual connection,
-    // by the safe fetcher in convex/model/safe-fetch.ts.
+    // by the safe fetcher in convex/model/safeFetch.ts.
     const url = normalizeExternalUrl(args.url);
     return await createItemWithOperation(
       ctx,
