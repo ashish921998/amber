@@ -10,6 +10,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { requireUserId } from "./model/auth";
 import { effectiveStatus } from "./model/memberships";
+import { normalizeExternalUrl } from "./model/externalUrl";
 
 /** Practical per-query cap so a very large library can't blow the read limit. */
 const LIST_CAP = 1000;
@@ -123,14 +124,6 @@ function buildSearchText(parts: {
     .filter((p): p is string => typeof p === "string" && p.length > 0)
     .join(" ")
     .toLowerCase();
-}
-
-function normalizeUrl(raw: string): string {
-  const trimmed = raw.trim();
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
-    return trimmed;
-  }
-  return `https://${trimmed}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -848,13 +841,15 @@ async function createItemWithOperation(
 }
 
 /** Throws if a link/note payload is empty/invalid. Validation is shared by the
- * operation-guarded and ordinary paths so both reject bad input identically. */
+ * operation-guarded and ordinary paths so both reject bad input identically.
+ * Link URLs are fully normalized by `createLinkItem` before this runs; the
+ * non-empty check here is defense-in-depth for direct callers. */
 function validateLinkOrNotePayload(
   kind: Extract<OperationKind, "link" | "note">,
   payload: { url: string } | { note: string },
 ): void {
   if (kind === "link") {
-    if (!("url" in payload) || payload.url === "https://") {
+    if (!("url" in payload) || typeof payload.url !== "string" || payload.url === "") {
       throw new Error("Invalid URL");
     }
     return;
@@ -899,7 +894,12 @@ export const createLinkItem = mutation({
   returns: v.id("items"),
   handler: async (ctx, args) => {
     const userId = await requireUserId(ctx);
-    const url = normalizeUrl(args.url);
+    // Centralized syntactic URL policy: rejects non-http(s) schemes, embedded
+    // credentials, non-default ports, missing hosts, and oversized URLs before
+    // the item is ever inserted or scheduled. Network-destination safety (private
+    // IP ranges, DNS answers) is enforced later, bound to the actual connection,
+    // by the safe fetcher in convex/model/safeFetch.ts.
+    const url = normalizeExternalUrl(args.url);
     return await createItemWithOperation(
       ctx,
       userId,

@@ -45,3 +45,7 @@ yarn-error.*
 *.apk
 # EAS Simulator session (carries a token - do not commit)
 .env.eas-simulator
+
+# Agent skill files (installed by Convex/agent tooling, not project code)
+.agents/skills/
+.claude/skills/
