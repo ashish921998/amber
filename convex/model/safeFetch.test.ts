@@ -460,6 +460,50 @@ describe("safeFetch HTTP policy", () => {
     }
   });
 
+  it("returns timeout (not a successful truncated result) when the deadline fires while draining overflow in truncate mode", async () => {
+    // A body whose first chunk exceeds maxBytes (triggering the truncate
+    // branch) and whose dump() outlives the deadline. safeDump swallows the
+    // abort, so without the post-dump signal.aborted re-check the caller
+    // would get a successful ok:true result instead of a timeout.
+    const slowDumpBody = {
+      async *[Symbol.asyncIterator]() {
+        yield Buffer.alloc(200);
+      },
+      async dump() {
+        // Drain takes longer than the 100ms deadline.
+        await new Promise((r) => setTimeout(r, 400));
+      },
+    };
+    const dispatcher: Dispatcher = {
+      request() {
+        return Promise.resolve({
+          statusCode: 200,
+          headers: { "content-type": "text/html" },
+          body: slowDumpBody,
+        } as unknown as Dispatcher.ResponseData);
+      },
+      dispatch() {
+        return false;
+      },
+      close() {
+        return Promise.resolve();
+      },
+      destroy() {
+        return Promise.resolve();
+      },
+    } as unknown as Dispatcher;
+    const result = await safeFetch("http://a.test/", {
+      timeoutMs: 100,
+      maxBytes: 50,
+      dispatcher,
+      onOverflow: "truncate",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("timeout");
+    }
+  });
+
   it("rejects a syntactically invalid url before any request", async () => {
     const agent = mockDispatcher();
     const result = await safeFetch("javascript:alert(1)", {

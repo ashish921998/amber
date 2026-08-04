@@ -351,6 +351,12 @@ async function readBounded(
         const kept = chunk.slice(0, chunk.length - excess);
         if (kept.length > 0) chunks.push(kept);
         await safeDump(body);
+        // safeDump swallows abort errors raised while draining. Re-check the
+        // signal so a deadline that fires during the dump is surfaced as a
+        // timeout instead of a successful truncated result.
+        if (signal.aborted) {
+          throw new SafeFetchErrorClass("timeout", "deadline exceeded while draining overflow");
+        }
         return new Uint8Array(Buffer.concat(chunks));
       }
       // Over cap in error mode: cancel the body by dumping the remainder.
