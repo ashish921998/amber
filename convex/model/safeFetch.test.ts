@@ -7,6 +7,7 @@ import {
   isPublicAddress,
   makeValidatingLookup,
   safeFetch,
+  decodeWithContentType,
 } from "./safeFetch";
 import type { DnsResolver } from "./safeFetch";
 import { MockAgent, type Dispatcher } from "undici";
@@ -421,6 +422,44 @@ describe("safeFetch HTTP policy", () => {
     }
   });
 
+  it("truncates an oversized stream when onOverflow is 'truncate'", async () => {
+    const agent = mockDispatcher();
+    agent
+      .get("http://a.test")
+      .intercept({ method: "GET", path: "/" })
+      .reply(200, Buffer.alloc(200), { headers: { "content-type": "text/html" } });
+    const result = await safeFetch("http://a.test/", {
+      timeoutMs: 2000,
+      maxBytes: 50,
+      dispatcher: agent,
+      onOverflow: "truncate",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.bytes.length).toBe(50);
+    }
+  });
+
+  it("truncates even when Content-Length declares more than maxBytes", async () => {
+    const agent = mockDispatcher();
+    agent
+      .get("http://a.test")
+      .intercept({ method: "GET", path: "/" })
+      .reply(200, Buffer.alloc(100), {
+        headers: { "content-type": "text/html", "content-length": "100" },
+      });
+    const result = await safeFetch("http://a.test/", {
+      timeoutMs: 2000,
+      maxBytes: 50,
+      dispatcher: agent,
+      onOverflow: "truncate",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.bytes.length).toBe(50);
+    }
+  });
+
   it("rejects a syntactically invalid url before any request", async () => {
     const agent = mockDispatcher();
     const result = await safeFetch("javascript:alert(1)", {
@@ -640,5 +679,48 @@ describe("secret leakage", () => {
     );
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(result.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decodeWithContentType: charset-aware decoding
+// ---------------------------------------------------------------------------
+
+describe("decodeWithContentType", () => {
+  it("decodes as UTF-8 when no charset is declared", () => {
+    const text = "héllo wörld";
+    const bytes = new TextEncoder().encode(text);
+    expect(decodeWithContentType(bytes, "text/html")).toBe(text);
+  });
+
+  it("decodes as UTF-8 when charset=utf-8 is declared", () => {
+    const text = "héllo";
+    const bytes = new TextEncoder().encode(text);
+    expect(decodeWithContentType(bytes, "text/html; charset=utf-8")).toBe(text);
+  });
+
+  it("decodes ISO-8859-1 when charset is declared", () => {
+    // 0xe9 is é in ISO-8859-1
+    const bytes = new Uint8Array([0x68, 0xe9, 0x6c, 0x6c, 0x6f]); // "héllo"
+    expect(decodeWithContentType(bytes, "text/html; charset=iso-8859-1")).toBe("héllo");
+  });
+
+  it("decodes Windows-1252 when charset is declared", () => {
+    // 0x92 is a curly apostrophe in Windows-1252
+    const bytes = new Uint8Array([0x73, 0x92]); // s + right single quote
+    const decoded = decodeWithContentType(bytes, "text/html; charset=windows-1252");
+    expect(decoded).toBe("s\u2019");
+  });
+
+  it("falls back to UTF-8 for an unsupported charset", () => {
+    const bytes = new Uint8Array([0x68, 0xe9, 0x6c, 0x6c, 0x6f]);
+    // Non-existent charset — should fall back to UTF-8 without throwing.
+    expect(() => decodeWithContentType(bytes, "text/html; charset=fake-charset")).not.toThrow();
+    expect(decodeWithContentType(bytes, "text/html; charset=fake-charset")).toContain("h");
+  });
+
+  it("extracts charset from quoted values", () => {
+    const bytes = new Uint8Array([0xe9]);
+    expect(decodeWithContentType(bytes, 'text/html; charset="iso-8859-1"')).toBe("é");
   });
 });

@@ -10,7 +10,7 @@ import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import {
   safeFetch,
-  decodeUtf8,
+  decodeWithContentType,
   parseJson,
   isSafeFetchError,
   type SafeFetchError,
@@ -418,8 +418,10 @@ async function fetchPage(url: string): Promise<PageData> {
   const result = await safeFetch(url, {
     timeoutMs: 15000,
     // Hard cap on the streamed page body. Generous for real articles; bounded
-    // to deny a malicious/buggy server from exhausting memory.
+    // to deny a malicious/buggy server from exhausting memory. Truncate instead
+    // of failing — a large page's first 1 MiB is still enough for extraction.
     maxBytes: 1024 * 1024,
+    onOverflow: "truncate",
     allowContentType: (ct) =>
       ct.startsWith("text/html") ||
       ct.startsWith("application/xhtml+xml") ||
@@ -438,7 +440,7 @@ async function fetchPage(url: string): Promise<PageData> {
     throw new PageFetchBlockedError(result.code);
   }
   const finalUrl = result.finalUrl;
-  const html = decodeUtf8(result.bytes);
+  const html = decodeWithContentType(result.bytes, result.contentType);
 
   const title = extractTitle(html);
   const description =

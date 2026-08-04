@@ -310,6 +310,13 @@ export type SafeFetchOptions = {
   dispatcher?: Dispatcher;
   /** Injected clock for tests. */
   now?: () => number;
+  /** Behavior when the streamed body exceeds `maxBytes`.
+   * - `"error"` (default): throw `response_too_large` so the caller can fail
+   *   the item.
+   * - `"truncate"`: stop reading at `maxBytes`, dump the remainder, and return
+   *   the bounded bytes as a successful result. Use for text pages where a
+   *   truncated prefix is still useful. */
+  onOverflow?: "error" | "truncate";
 };
 
 const DEFAULT_MAX_REDIRECTS = 3;
@@ -319,12 +326,16 @@ const DEFAULT_MAX_REDIRECTS = 3;
 // ---------------------------------------------------------------------------
 
 /** Read at most `maxBytes` from an undici response body, enforcing the cap
- * even when Content-Length is missing or lied about. Returns the bounded bytes
- * or throws SafeFetchErrorClass(response_too_large) if the limit is exceeded. */
+ * even when Content-Length is missing or lied about.
+ *
+ * When `onOverflow` is `"error"` (the default), exceeding the cap throws
+ * `response_too_large`. When `"truncate"`, the reader stops at `maxBytes`,
+ * dumps the remainder, and returns the bounded prefix as a successful result. */
 async function readBounded(
   body: BodyReadable,
   maxBytes: number,
   signal: AbortSignal,
+  onOverflow: "error" | "truncate" = "error",
 ): Promise<Uint8Array> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -334,7 +345,15 @@ async function readBounded(
     }
     total += chunk.length;
     if (total > maxBytes) {
-      // Over cap: cancel the body by dumping the remainder.
+      if (onOverflow === "truncate") {
+        // Keep only the bytes up to the cap, dump the rest, return the prefix.
+        const excess = total - maxBytes;
+        const kept = chunk.slice(0, chunk.length - excess);
+        if (kept.length > 0) chunks.push(kept);
+        await safeDump(body);
+        return new Uint8Array(Buffer.concat(chunks));
+      }
+      // Over cap in error mode: cancel the body by dumping the remainder.
       await safeDump(body);
       throw new SafeFetchErrorClass("response_too_large", "body exceeded max bytes");
     }
@@ -382,6 +401,7 @@ async function safeFetchThrowing(
     headers = {},
     maxRedirects = DEFAULT_MAX_REDIRECTS,
     dispatcher = getSharedDispatcher(),
+    onOverflow = "error",
   } = options;
 
   // Re-validate the URL syntactically on entry. external-url enforces scheme,
@@ -470,15 +490,19 @@ async function safeFetchThrowing(
         );
       }
       // Pre-check a declared Content-Length against the cap before streaming.
-      const declared = response.headers["content-length"];
-      if (typeof declared === "string") {
-        const len = Number(declared);
-        if (Number.isFinite(len) && len > maxBytes) {
-          await safeDump(response.body);
-          throw new SafeFetchErrorClass("response_too_large", "content-length over cap");
+      // Skip this pre-check in truncate mode — the reader will stop at maxBytes
+      // and return the prefix instead of failing.
+      if (onOverflow === "error") {
+        const declared = response.headers["content-length"];
+        if (typeof declared === "string") {
+          const len = Number(declared);
+          if (Number.isFinite(len) && len > maxBytes) {
+            await safeDump(response.body);
+            throw new SafeFetchErrorClass("response_too_large", "content-length over cap");
+          }
         }
       }
-      const bytes = await readBounded(response.body, maxBytes, ac.signal);
+      const bytes = await readBounded(response.body, maxBytes, ac.signal, onOverflow);
       return {
         finalUrl: currentUrl,
         status: response.statusCode,
@@ -566,6 +590,27 @@ async function safeDump(body: BodyReadable | null | undefined): Promise<void> {
 /** Decode bounded bytes as text using UTF-8. The stream cap already bounded
  * the size; this just converts. Callers should still slice for their needs. */
 export function decodeUtf8(bytes: Uint8Array): string {
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+/** Decode bounded bytes as text, honoring the charset declared in the
+ * Content-Type header. Extracts `charset=...` from the header (case-insensitive),
+ * uses it if Node's TextDecoder supports it, and falls back to UTF-8 when the
+ * charset is absent or unsupported. This avoids mojibake on pages served as
+ * ISO-8859-1, Windows-1252, Shift_JIS, etc. */
+export function decodeWithContentType(
+  bytes: Uint8Array,
+  contentType: string,
+): string {
+  const match = contentType.match(/charset\s*=\s*["']?([\w-]+)/i);
+  const charset = match?.[1]?.toLowerCase();
+  if (charset && charset !== "utf-8" && charset !== "utf8") {
+    try {
+      return new TextDecoder(charset).decode(bytes);
+    } catch {
+      // Unsupported charset label — fall back to UTF-8.
+    }
+  }
   return new TextDecoder("utf-8").decode(bytes);
 }
 
