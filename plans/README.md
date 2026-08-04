@@ -15,7 +15,7 @@ when done.
 | 004 | Make incoming shares recoverable | P1 | L | 003 | IN PROGRESS — automated tests pass (104); Step 5 manual iOS/Android device matrix (retry, remount, process-termination) still pending |
 | 005 | Make Tidy saves durable | P1 | L | 003 | TODO |
 | 006 | Preserve Tidy deletions when confirmation fails | P1 | M | 005 | TODO |
-| 007 | Enforce a safe backend URL-fetch policy | P1 | L | 001 | IN PROGRESS — code/tests/check/SSRF-scan done (167 tests); live dev-deployment manual verification (Step 6) still pending |
+| 007 | Enforce a safe backend URL-fetch policy | P1 | L | 001 | IN PROGRESS — deployment blockers fixed (`"use node"` + camelCase renames), Convex deploy succeeds, 166 tests pass, SSRF scan clean, content-type predicates tightened (json/image allowlist), syntactic vectors verified live (file:/// + credentials rejected); positive article + connection-level live test blocked by Clerk JWT expiry in dev env |
 | 008 | Keep optional AI enrichment from failing ready items | P1 | M | 007 | TODO |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |

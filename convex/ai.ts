@@ -14,7 +14,7 @@ import {
   parseJson,
   isSafeFetchError,
   type SafeFetchError,
-} from "./model/safe-fetch";
+} from "./model/safeFetch";
 
 // Bare model-id strings route through the Vercel AI Gateway automatically
 // (authenticated via the AI_GATEWAY_API_KEY deployment env var).
@@ -214,7 +214,19 @@ async function fetchImageAspectRatio(
     // safe fetcher enforces this cap on actual streamed bytes regardless of
     // what the server sends, so a Range-ignoring server still cannot exhaust us.
     maxBytes: 131072,
-    allowContentType: (ct) => ct.startsWith("image/"),
+    // Allow only the raster types readImageSize parses (PNG/GIF/WebP/JPEG).
+    // SVG is intentionally excluded: it is XML and can carry scripts/XXE, and
+    // readImageSize returns undefined for it anyway. ct is already lowercased
+    // by the safe fetcher.
+    allowContentType: (ct) =>
+      ct === "image/png" ||
+      ct === "image/gif" ||
+      ct === "image/webp" ||
+      ct === "image/jpeg" ||
+      ct.startsWith("image/png;") ||
+      ct.startsWith("image/gif;") ||
+      ct.startsWith("image/webp;") ||
+      ct.startsWith("image/jpeg;"),
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -365,14 +377,14 @@ type PageData = {
  * a sanitized category. A blocked primary page fetch is a CORE processing
  * failure, unlike a blocked best-effort hero image.
  */
-export class PageFetchBlockedError extends Error {
+class PageFetchBlockedError extends Error {
   constructor(public readonly code: SafeFetchError) {
     super(`page fetch blocked: ${code}`);
     this.name = "PageFetchBlockedError";
   }
 }
 
-export function isPageFetchBlockedError(
+function isPageFetchBlockedError(
   e: unknown,
 ): e is PageFetchBlockedError {
   return e instanceof PageFetchBlockedError;
@@ -388,6 +400,9 @@ function summarizeError(error: unknown): string {
   if (isPageFetchBlockedError(error)) {
     return `page_fetch_blocked:${error.code}`;
   }
+  // Defensive: safeFetch returns error codes in its result type and never
+  // throws SafeFetchErrorClass itself, but if a future caller uses the
+  // throwing variant directly this branch ensures the error is summarized.
   if (isSafeFetchError(error)) {
     return `safe_fetch:${error.code}`;
   }
@@ -1026,7 +1041,7 @@ export const findProductLinks = internalAction({
         timeoutMs: 20000,
         maxBytes: 1024 * 1024,
         allowContentType: (ct) =>
-          ct.startsWith("application/json") || ct.includes("json"),
+          ct === "application/json" || ct.startsWith("application/json;"),
       });
       if (!result.ok) {
         // Log only the policy code — never the URL (it carries the API key),
